@@ -2,7 +2,7 @@
 //! с `pcdockd` по протоколу; в тестах подставляется фейк.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -85,6 +85,15 @@ pub trait Backend: Send + Sync {
     fn file_list(&self, _phone: u32, _path: &str) -> Result<Vec<String>, String> {
         Err("передача файлов не поддерживается".into())
     }
+    /// Запрос к приложению на телефоне: `req` — `{"op": "LaunchApp" | "ListApps" | "UiDump" | "ExitInfo" | "IpCheck" | "HttpLocal" | "TypeText", …}`
+    /// без `phone` и `request`. Возвращает ответ телефона без номера запроса (части `UiDump` склеены).
+    fn app(&self, _phone: u32, _req: Value, _timeout: Duration) -> Result<String, String> {
+        Err("запросы к приложению не поддерживаются".into())
+    }
+    /// Пакет приложения на переднем плане, если телефон его сообщает (возможность 6).
+    fn foreground(&self, _phone: u32) -> Option<String> {
+        None
+    }
     fn file_delete(&self, _phone: u32, _path: &str) -> Result<(), String> {
         Err("передача файлов не поддерживается".into())
     }
@@ -105,6 +114,57 @@ struct Routes {
 
 // ---------------------------------------------------------------------------------------------
 
+/// Ответ на запрос к приложению: полученные части (у `UiDump` их несколько) и склеенный ответ.
+type AppReply = (Vec<Option<String>>, Option<String>);
+
+/// Ответы приложения на запросы (`Status` 18–25) и передний план (16/17).
+#[derive(Default)]
+struct AppReplies {
+    /// Номер запроса → части ответа (у `UiDump` их несколько) и склеенный ответ.
+    map: Mutex<HashMap<u32, AppReply>>,
+    foreground: Mutex<HashMap<u32, String>>,
+    changed: Condvar,
+}
+
+impl AppReplies {
+    /// Разбирает `Status` телефона `phone`.
+    fn on_status(&self, phone: u32, code: u64, detail: &str) {
+        match code {
+            16 => {
+                self.foreground.lock().unwrap().insert(phone, detail.trim().to_string());
+                return;
+            }
+            17 => {
+                self.foreground.lock().unwrap().remove(&phone);
+                return;
+            }
+            18..=20 | 22..=25 => {}
+            _ => return,
+        }
+        let Some((id, rest)) = detail.split_once(' ') else { return };
+        let Ok(id) = id.parse::<u32>() else { return };
+        let mut map = self.map.lock().unwrap();
+        let Some(entry) = map.get_mut(&id) else { return };
+        if code == 20 {
+            // "<i>/<n> <часть>"
+            let (head, part) = rest.split_once(' ').unwrap_or((rest, ""));
+            let Some((i, n)) = head.split_once('/') else { return };
+            let (Ok(i), Ok(n)) = (i.parse::<usize>(), n.parse::<usize>()) else { return };
+            if n == 0 || i == 0 || i > n || n > 10_000 {
+                return;
+            }
+            entry.0.resize(n, None);
+            entry.0[i - 1] = Some(part.to_string());
+            if entry.0.iter().all(Option::is_some) {
+                entry.1 = Some(entry.0.iter().flatten().cloned().collect());
+            }
+        } else {
+            entry.1 = Some(rest.to_string());
+        }
+        self.changed.notify_all();
+    }
+}
+
 struct FrameStore {
     frames: Mutex<HashMap<u32, Frame>>,
     changed: Condvar,
@@ -120,6 +180,8 @@ pub struct FarmBackend {
     fps: f32,
     alive: Arc<AtomicBool>,
     routes: Arc<Routes>,
+    apps: Arc<AppReplies>,
+    next_request: AtomicU32,
 }
 
 fn info_from(v: &Value) -> Option<PhoneInfo> {
@@ -148,6 +210,7 @@ impl FarmBackend {
         let events = client.take_events().ok_or("события уже забраны")?;
         let binary = client.take_binary().ok_or("бинарные пакеты уже забраны")?;
         let routes = Arc::new(Routes::default());
+        let apps = Arc::new(AppReplies::default());
         let me = Arc::new(Self {
             client: client.clone(),
             phones: phones.clone(),
@@ -156,12 +219,14 @@ impl FarmBackend {
             fps,
             alive: alive.clone(),
             routes: routes.clone(),
+            apps: apps.clone(),
+            next_request: AtomicU32::new(1),
         });
         me.refresh()?;
 
         // События о телефонах: обновляют состояние.
         {
-            let (phones, alive, routes) = (phones.clone(), alive.clone(), routes.clone());
+            let (phones, alive, routes, apps) = (phones.clone(), alive.clone(), routes.clone(), apps.clone());
             thread::Builder::new()
                 .name("autod-farm-events".into())
                 .spawn(move || {
@@ -180,6 +245,14 @@ impl FarmBackend {
                         }
                         let id = v["phone"].as_u64().map(|x| x as u32);
                         let Some(id) = id else { continue };
+                        if v["ev"] == "Status" {
+                            apps.on_status(
+                                id,
+                                v["code"].as_u64().unwrap_or(0),
+                                v["detail"].as_str().unwrap_or(""),
+                            );
+                            continue;
+                        }
                         let mut map = phones.lock().unwrap();
                         match v["ev"].as_str() {
                             Some("Appeared") => {
@@ -417,6 +490,35 @@ impl Backend for FarmBackend {
         self.op(json!({"op": "FileDelete", "phone": phone, "path": path}))
     }
 
+    fn app(&self, phone: u32, mut req: Value, timeout: Duration) -> Result<String, String> {
+        let id = self.next_request.fetch_add(1, Ordering::SeqCst);
+        req["phone"] = json!(phone);
+        req["request"] = json!(id);
+        self.apps.map.lock().unwrap().insert(id, (Vec::new(), None));
+        if let Err(e) = self.op(req) {
+            self.apps.map.lock().unwrap().remove(&id);
+            return Err(e);
+        }
+        let end = Instant::now() + timeout;
+        let mut map = self.apps.map.lock().unwrap();
+        loop {
+            if let Some(done) = map.get(&id).and_then(|r| r.1.clone()) {
+                map.remove(&id);
+                return Ok(done);
+            }
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() || !self.alive.load(Ordering::SeqCst) {
+                map.remove(&id);
+                return Err("телефон не ответил вовремя".into());
+            }
+            map = self.apps.changed.wait_timeout(map, left.min(Duration::from_millis(200))).unwrap().0;
+        }
+    }
+
+    fn foreground(&self, phone: u32) -> Option<String> {
+        self.apps.foreground.lock().unwrap().get(&phone).cloned()
+    }
+
     fn wait_frame(&self, phone: u32, after: Option<u64>, timeout: Duration) -> Option<Frame> {
         let deadline = Instant::now() + timeout;
         let mut map = self.frames.frames.lock().unwrap();
@@ -578,5 +680,11 @@ impl Backend for ReconnectBackend {
     }
     fn file_delete(&self, phone: u32, path: &str) -> Result<(), String> {
         self.get()?.file_delete(phone, path)
+    }
+    fn app(&self, phone: u32, req: Value, timeout: Duration) -> Result<String, String> {
+        self.get()?.app(phone, req, timeout)
+    }
+    fn foreground(&self, phone: u32) -> Option<String> {
+        self.get().ok()?.foreground(phone)
     }
 }

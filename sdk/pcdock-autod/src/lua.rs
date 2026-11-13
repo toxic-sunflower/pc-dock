@@ -32,6 +32,7 @@ use serde_json::{json, Value as Json};
 use crate::backend::{Backend, Frame, PhoneInfo};
 use crate::events::Sink;
 use crate::jpeg::jpeg_size;
+use crate::uitree::{self, Selector};
 
 /// Параметры прогона.
 pub struct RunConfig {
@@ -412,6 +413,159 @@ impl PhoneHandle {
     }
 }
 
+/// Селектор элемента из Lua: строка — текст целиком, таблица — `{text=, text_contains=, id=, desc=, class=, index=}`.
+fn selector(v: &Value) -> mlua::Result<Selector> {
+    let sel = match v {
+        Value::String(s) => Selector { text: Some(s.to_string_lossy()), ..Default::default() },
+        Value::Table(t) => Selector {
+            text: t.get("text")?,
+            text_contains: t.get("text_contains")?,
+            id: t.get("id")?,
+            desc: t.get("desc")?,
+            class: t.get("class")?,
+            index: t.get::<Option<usize>>("index")?.unwrap_or(0),
+        },
+        _ => {
+            return Err(mlua::Error::runtime(
+                "элемент: строка (текст) или таблица {text=, id=, desc=, class=}",
+            ))
+        }
+    };
+    if sel.is_empty() {
+        return Err(mlua::Error::runtime("элемент: задайте text, text_contains, id, desc или class"));
+    }
+    Ok(sel)
+}
+
+/// Ответ приложения как значение Lua: JSON — таблица, иначе строка.
+fn reply_value(lua: &Lua, s: &str) -> mlua::Result<Value> {
+    match serde_json::from_str::<Json>(s.trim()) {
+        Ok(j) if j.is_object() || j.is_array() => json_to_lua(lua, &j),
+        _ => Ok(Value::String(lua.create_string(s.trim())?)),
+    }
+}
+
+/// Ответ `HttpLocal` → таблица `{ok, code, body, headers, ms}` или `{ok = false, error}`: JSON телефона как есть,
+/// а ответ без JSON (`"error unsupported"` от сессии, если приложение pc-dock старое) — `{ok = false, error = …}`.
+fn http_reply(lua: &Lua, s: &str) -> mlua::Result<Value> {
+    if let Ok(j) = serde_json::from_str::<Json>(s.trim()) {
+        if j.is_object() {
+            return json_to_lua(lua, &j);
+        }
+    }
+    let why = s.trim();
+    let why = why.strip_prefix("error ").unwrap_or(why);
+    json_to_lua(lua, &json!({"ok": false, "error": why}))
+}
+
+/// Можно ли набрать текст HID-клавиатурой `p:type` по-старому: латиница, цифры, пробел и `-=.,/`.
+fn hid_typeable(text: &str) -> bool {
+    text.chars().all(|c| c.is_ascii() && usage_for(&c.to_ascii_lowercase().to_string()).is_some())
+}
+
+/// Ответ `TypeText` (возможность 13) → способ ввода (`paste`, `set_text`, `clipboard`) или ошибка. Старое приложение
+/// pc-dock (сессия ответила `error unsupported`) — ошибка с кодом `app_outdated` в начале сообщения.
+fn text_input_reply(r: &str) -> Result<String, String> {
+    let r = r.trim();
+    match serde_json::from_str::<Json>(r) {
+        Ok(j) if j.is_object() => {
+            if j["ok"] == true {
+                return Ok(j["method"].as_str().unwrap_or("").to_string());
+            }
+            Err(format!("text_input_failed: телефон не ввёл текст ({})", j["error"].as_str().unwrap_or("?")))
+        }
+        _ => match r.strip_prefix("error ").unwrap_or(r) {
+            "unsupported" => Err("app_outdated: приложение pc-dock на телефоне не умеет вводить такой текст \
+                                  (кириллица, эмодзи, знаки; нужна возможность 13 TEXT_INPUT) — обновите приложение pc-dock"
+                .into()),
+            why => Err(format!("text_input_failed: {why}")),
+        },
+    }
+}
+
+impl PhoneHandle {
+    /// Ввести текст через приложение pc-dock (`TypeText`, возможность 13): телефон вставляет его в поле с курсором
+    /// сам или кладёт в буфер обмена — тогда жмём Ctrl+V HID-клавиатурой. Возвращает способ ввода.
+    fn text_input(&self, text: &str) -> mlua::Result<String> {
+        let r = self.app(json!({"op": "TypeText", "text": text}), Duration::from_secs(15))?;
+        let method = text_input_reply(&r).map_err(mlua::Error::runtime)?;
+        if method == "clipboard" {
+            // Ctrl (0xE0) + V (0x19)
+            let k = |usage: u16, down: bool| {
+                self.st.backend.key(self.id, usage, down).map_err(mlua::Error::runtime)
+            };
+            k(0xE0, true)?;
+            k(0x19, true)?;
+            k(0x19, false)?;
+            k(0xE0, false)?;
+        }
+        Ok(method)
+    }
+
+    /// Запрос к приложению на телефоне с ответом-строкой.
+    fn app(&self, req: Json, timeout: Duration) -> mlua::Result<String> {
+        self.st.check_alive()?;
+        self.st.backend.app(self.id, req, timeout).map_err(mlua::Error::runtime)
+    }
+
+    /// Элементы экрана сейчас; ошибка, если телефон их не отдал.
+    fn ui_nodes(&self) -> mlua::Result<(String, Vec<uitree::Node>)> {
+        let r = self.app(json!({"op": "UiDump"}), Duration::from_secs(10))?;
+        let xml = r.strip_prefix("xml").map(str::trim_start).ok_or_else(|| {
+            mlua::Error::runtime(format!(
+                "элементы экрана недоступны: {}",
+                r.chars().take(120).collect::<String>()
+            ))
+        })?;
+        Ok((xml.to_string(), uitree::parse(xml)))
+    }
+
+    /// Ждёт элемент до срока (0 — одна попытка). Возвращает элемент и размер экрана.
+    fn wait_node(
+        &self,
+        sel: &Selector,
+        timeout: Duration,
+    ) -> mlua::Result<Option<(uitree::Node, (i32, i32))>> {
+        let end = Instant::now() + timeout;
+        loop {
+            // Окно ещё не готово (`no_window`: приложение только что открылось) — ждём до срока, как «не найден»
+            let nodes = match self.ui_nodes() {
+                Ok((_, nodes)) => nodes,
+                Err(e) if e.to_string().contains("no_window") && Instant::now() < end => Vec::new(),
+                Err(e) => return Err(e),
+            };
+            if let (Some(n), Some(size)) = (uitree::find(&nodes, sel), uitree::screen_size(&nodes)) {
+                return Ok(Some((n.clone(), size)));
+            }
+            if Instant::now() >= end {
+                return Ok(None);
+            }
+            self.st.sleep(Duration::from_millis(500))?;
+        }
+    }
+}
+
+fn node_table(lua: &Lua, n: &uitree::Node, size: (i32, i32)) -> mlua::Result<Table> {
+    let t = lua.create_table()?;
+    let (cx, cy) = n.center();
+    t.set("text", n.text.as_str())?;
+    t.set("id", n.id.as_str())?;
+    t.set("desc", n.desc.as_str())?;
+    t.set("class", n.class.as_str())?;
+    t.set("package", n.package.as_str())?;
+    t.set("clickable", n.clickable)?;
+    t.set("enabled", n.enabled)?;
+    // Центр в долях экрана — те же координаты, что у `p:tap`.
+    t.set("x", cx / size.0 as f32)?;
+    t.set("y", cy / size.1 as f32)?;
+    let b = lua.create_table()?;
+    for (i, v) in [n.bounds.0, n.bounds.1, n.bounds.2, n.bounds.3].into_iter().enumerate() {
+        b.set(i + 1, v)?;
+    }
+    t.set("bounds", b)?;
+    Ok(t)
+}
+
 impl UserData for PhoneHandle {
     fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
         fields.add_field_method_get("id", |_, t| Ok(t.id));
@@ -483,8 +637,18 @@ impl UserData for PhoneHandle {
             t.st.sleep(opt_secs(&o, "hold", 0.03))?;
             t.st.backend.key(t.id, usage, false).map_err(mlua::Error::runtime)
         });
-        // Набор текста из латиницы, цифр и пробела (заглавные через Shift).
-        methods.add_method("type", |_, t, text: String| {
+        // Набор текста. Латиница, цифры, пробел и `-=.,/` — HID-клавиатурой (заглавные через Shift), как раньше;
+        // остальное (кириллица, эмодзи, `#@!`, переводы строк) — через приложение pc-dock (возможность 13 TEXT_INPUT).
+        // Старое приложение без неё — ошибка «app_outdated: …».
+        methods.add_method("type", |_, t, text: mlua::String| {
+            let text = text.to_str()?.to_string();
+            if text.is_empty() {
+                return Ok(());
+            }
+            if !hid_typeable(&text) {
+                t.st.check_alive()?;
+                return t.text_input(&text).map(|_| ());
+            }
             for c in text.chars() {
                 t.st.check_alive()?;
                 let usage = usage_for(&c.to_ascii_lowercase().to_string())
@@ -500,6 +664,13 @@ impl UserData for PhoneHandle {
                 }
             }
             Ok(())
+        });
+        // Вставить текст (любой) в поле с курсором через приложение pc-dock (возможность 13 TEXT_INPUT), без набора по
+        // клавише; возвращает способ: "paste", "set_text" или "clipboard" (буфер обмена + Ctrl+V).
+        methods.add_method("paste", |_, t, text: mlua::String| {
+            let text = text.to_str()?.to_string();
+            t.st.check_alive()?;
+            t.text_input(&text)
         });
         methods.add_method("scroll", |_, t, ticks: f32| {
             t.st.check_alive()?;
@@ -556,6 +727,88 @@ impl UserData for PhoneHandle {
         methods.add_method("rm", |_, t, path: String| {
             t.st.check_alive()?;
             t.st.backend.file_delete(t.id, &path).map_err(mlua::Error::runtime)
+        });
+        // Приложение на телефоне (нужно приложение pc-dock с возможностями 6–12).
+        // Открыть приложение по пакету; возвращает итог телефона: "ok", "not_installed", "blocked_bal", "error …".
+        methods.add_method("launch", |_, t, (pkg, o): (String, Option<Table>)| {
+            let r = t.app(json!({"op": "LaunchApp", "package": pkg}), opt_secs(&o, "timeout", 10.0))?;
+            t.st.emit("log", json!({"test": *t.st.current.lock().unwrap(), "level": "debug", "text": format!("открыть {pkg}: {r}")}));
+            Ok(r)
+        });
+        // Приложения с главным экраном: таблица из ответа телефона.
+        methods.add_method("apps", |lua, t, ()| {
+            let r = t.app(json!({"op": "ListApps"}), Duration::from_secs(15))?;
+            reply_value(lua, &r)
+        });
+        // Пакет на переднем плане или nil.
+        methods.add_method("foreground", |_, t, ()| Ok(t.st.backend.foreground(t.id)));
+        // Элементы экрана как XML uiautomator.
+        methods.add_method("ui", |_, t, ()| Ok(t.ui_nodes()?.0));
+        // Найти элемент: `p:find("Войти")`, `p:find({id = "login"}, {timeout = 5})` → таблица {text, id, x, y, …} или nil.
+        methods.add_method("find", |lua, t, (sel, o): (Value, Option<Table>)| {
+            let sel = selector(&sel)?;
+            match t.wait_node(&sel, opt_secs(&o, "timeout", 0.0))? {
+                Some((n, size)) => Ok(Some(node_table(lua, &n, size)?)),
+                None => Ok(None),
+            }
+        });
+        // Ждёт появления элемента; true/false по сроку (по умолчанию 10 с).
+        methods.add_method("wait_for", |_, t, (sel, timeout): (Value, Option<f64>)| {
+            let sel = selector(&sel)?;
+            Ok(t.wait_node(&sel, Duration::from_secs_f64(timeout.unwrap_or(10.0)))?.is_some())
+        });
+        // Нажать на элемент (ждёт его до `timeout`, по умолчанию 10 с); нет элемента — ошибка.
+        methods.add_method("tap_on", |_, t, (sel, o): (Value, Option<Table>)| {
+            let sel = selector(&sel)?;
+            let Some((n, size)) = t.wait_node(&sel, opt_secs(&o, "timeout", 10.0))? else {
+                return Err(mlua::Error::runtime(format!("элемент не найден: {}", sel.describe())));
+            };
+            let (cx, cy) = n.center();
+            let (x, y) = (cx / size.0 as f32, cy / size.1 as f32);
+            t.touch(0, x, y, &o)?;
+            t.st.sleep(opt_secs(&o, "hold", 0.05))?;
+            t.touch(2, x, y, &o)
+        });
+        // Причины завершения приложения после `since_ms` (мс Unix): таблица или строка ("unsupported"…).
+        methods.add_method("exit_info", |lua, t, (pkg, since): (String, Option<u64>)| {
+            let r = t.app(
+                json!({"op": "ExitInfo", "package": pkg, "since_ms": since.unwrap_or(0)}),
+                Duration::from_secs(10),
+            )?;
+            reply_value(lua, &r)
+        });
+        // Внешний IP телефона: HTTPS GET по его сети; таблица {body, code, network, …} или строка-ошибка.
+        methods.add_method("ip", |lua, t, url: String| {
+            let r = t.app(json!({"op": "IpCheck", "url": url}), Duration::from_secs(30))?;
+            reply_value(lua, &r)
+        });
+        // HTTP-запрос к устройству локальной Wi-Fi-сети телефона (админка роутера и т.п.), через Wi-Fi телефона:
+        // `p:http{method = "POST", url = "http://192.168.1.1/…", headers = {…}, body = "…", timeout = 10}` →
+        // `{ok, code, body, headers, ms}` (любой код HTTP — ok = true) или `{ok = false, error}`.
+        methods.add_method("http", |lua, t, o: Table| {
+            let method =
+                o.get::<Option<String>>("method")?.unwrap_or_else(|| "GET".into()).to_ascii_uppercase();
+            let url: String =
+                o.get::<Option<String>>("url")?.ok_or_else(|| mlua::Error::runtime("p:http: нужен url"))?;
+            let mut headers = serde_json::Map::new();
+            if let Some(h) = o.get::<Option<Table>>("headers")? {
+                for pair in h.pairs::<String, String>() {
+                    let (k, v) = pair?;
+                    headers.insert(k, Json::String(v));
+                }
+            }
+            let body = o
+                .get::<Option<mlua::String>>("body")?
+                .map(|b| String::from_utf8_lossy(&b.as_bytes()).into_owned())
+                .unwrap_or_default();
+            let timeout = o.get::<Option<f64>>("timeout")?.unwrap_or(10.0).clamp(0.001, 30.0);
+            let timeout_ms = (timeout * 1000.0).round() as u32;
+            let r = t.app(
+                json!({"op": "HttpLocal", "method": method, "url": url, "headers": headers, "body": body,
+                       "timeout_ms": timeout_ms}),
+                Duration::from_millis(timeout_ms as u64) * 2 + Duration::from_secs(5),
+            )?;
+            http_reply(lua, &r)
         });
         // Последний кадр экрана; `{fresh = true}` — дождаться нового, `{timeout = N}` — срок ожидания.
         methods.add_method("frame", |_, t, o: Option<Table>| {
@@ -1187,6 +1440,34 @@ mod tests {
             self.files.lock().unwrap().remove(path);
             Ok(())
         }
+        fn app(&self, phone: u32, req: Json, _timeout: Duration) -> Result<String, String> {
+            self.log.lock().unwrap().push(format!("app {phone} {req}"));
+            Ok(match req["op"].as_str() {
+                Some("LaunchApp") => "ok".into(),
+                Some("ListApps") => r#"[{"package":"com.app","label":"App"}]"#.into(),
+                Some("UiDump") => concat!(
+                    r#"xml <hierarchy rotation="0"><node text="" class="android.widget.FrameLayout" bounds="[0,0][1000,2000]">"#,
+                    r#"<node text="Войти" resource-id="com.app:id/login" class="android.widget.Button" clickable="true" bounds="[100,1000][300,1200]" />"#,
+                    "</node></hierarchy>"
+                )
+                .into(),
+                Some("IpCheck") => r#"{"code":200,"body":"1.2.3.4"}"#.into(),
+                Some("HttpLocal") if req["url"] == "http://192.168.1.1/cgi?1" => {
+                    r#"{"ok":true,"code":401,"body":"[error]0","headers":{"set-cookie":"JSESSIONID=1"},"ms":30}"#.into()
+                }
+                Some("HttpLocal") => "error unsupported".into(),
+                Some("TypeText") => match req["text"].as_str().unwrap_or("") {
+                    "старое приложение" => "error unsupported".into(),
+                    t if t.starts_with("буфер") => r#"{"ok":true,"method":"clipboard","reason":"no_service","ms":2}"#.into(),
+                    "сбой" => r#"{"ok":false,"error":"clipboard: SecurityException","ms":1}"#.into(),
+                    _ => r#"{"ok":true,"method":"paste","ms":40}"#.into(),
+                },
+                _ => "unsupported".into(),
+            })
+        }
+        fn foreground(&self, _phone: u32) -> Option<String> {
+            Some("com.app".into())
+        }
         fn latest_frame(&self, _phone: u32) -> Option<Frame> {
             self.frames.lock().unwrap().last().cloned()
         }
@@ -1224,6 +1505,97 @@ mod tests {
         let sink = Arc::new(Collect::default());
         let r = run_script(src, "demo", &cfg, fake.clone(), sink.clone(), Arc::new(AtomicBool::new(false)));
         (r, sink)
+    }
+
+    #[test]
+    fn type_uses_text_input_for_unicode_and_hid_for_plain_latin() {
+        let fake = Fake::new();
+        let (r, _sink) = run(
+            r#"
+            test("text", function()
+              local p = phones()[1]
+              p:type("ab")
+              p:type("")
+              p:type("Привет 👋 #тест\nстрока")
+              assert.eq(p:paste("plain"), "paste")
+              assert.eq(p:paste("буфер ✨"), "clipboard")
+              local ok, e = pcall(function() p:type("старое приложение") end)
+              assert.falsy(ok)
+              assert.contains(tostring(e), "app_outdated")
+              local ok2, e2 = pcall(function() p:paste("сбой") end)
+              assert.falsy(ok2)
+              assert.contains(tostring(e2), "text_input_failed")
+              assert.contains(tostring(e2), "SecurityException")
+            end)
+            "#,
+            &fake,
+        );
+        assert_eq!(r.status, "passed", "{r:?}");
+        let log = fake.log();
+        let apps: Vec<&String> = log.iter().filter(|l| l.contains(r#""op":"TypeText""#)).collect();
+        assert_eq!(apps.len(), 5, "{log:?}");
+        assert!(apps[0].contains(r#""text":"Привет 👋 #тест\nстрока""#), "{apps:?}");
+        assert!(!log.iter().any(|l| l.contains(r#""text":"ab""#)), "латиница — HID, не TEXT_INPUT");
+        // «ab» — HID (a = 0x4, b = 0x5); после ответа «clipboard» — Ctrl+V: Ctrl (0xE0) вниз, V (0x19), Ctrl вверх
+        let keys: Vec<&str> = log.iter().filter(|l| l.starts_with("key")).map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "key 1 0x4 true",
+                "key 1 0x4 false",
+                "key 1 0x5 true",
+                "key 1 0x5 false",
+                "key 1 0xe0 true",
+                "key 1 0x19 true",
+                "key 1 0x19 false",
+                "key 1 0xe0 false",
+            ]
+        );
+    }
+
+    #[test]
+    fn app_requests_and_screen_elements_from_lua() {
+        let fake = Fake::new();
+        let (r, _sink) = run(
+            r#"
+            test("app", function()
+              local p = phones()[1]
+              assert.eq(p:launch("com.app"), "ok")
+              assert.eq(p:apps()[1].package, "com.app")
+              assert.eq(p:foreground(), "com.app")
+              assert.eq(p:ip("https://example.com/ip").body, "1.2.3.4")
+              local h = p:http{method = "post", url = "http://192.168.1.1/cgi?1", headers = {Referer = "http://192.168.1.1/"},
+                               body = "[x]", timeout = 5}
+              assert.truthy(h.ok)
+              assert.eq(h.code, 401)
+              assert.eq(h.body, "[error]0")
+              assert.eq(h.headers["set-cookie"], "JSESSIONID=1")
+              local old = p:http{url = "http://192.168.1.1/"}
+              assert.falsy(old.ok)
+              assert.eq(old.error, "unsupported")
+              assert.eq(p:exit_info("com.app", 5), "unsupported")
+              local e = p:find({id = "login"})
+              assert.eq(e.text, "Войти")
+              assert.near(e.x, 0.2, 0.001)
+              assert.near(e.y, 0.55, 0.001)
+              assert.truthy(p:wait_for("войти", 1))
+              assert.falsy(p:find("Нет такого"))
+              p:tap_on("Войти")
+              assert.contains(p:ui(), "hierarchy")
+            end)
+            "#,
+            &fake,
+        );
+        assert_eq!(r.status, "passed", "{r:?}");
+        let log = fake.log().join("\n");
+        assert!(log.contains(r#""op":"LaunchApp""#) && log.contains(r#""package":"com.app""#), "{log}");
+        assert!(
+            log.contains(r#""method":"POST""#)
+                && log.contains(r#""timeout_ms":5000"#)
+                && log.contains(r#""headers":{"Referer":"http://192.168.1.1/"}"#),
+            "{log}"
+        );
+        assert!(log.contains("touch 1 0 0.20 0.55") && log.contains("touch 1 2 0.20 0.55"), "{log}");
     }
 
     #[test]

@@ -38,7 +38,18 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             name: format!("pcdock-core/{}", env!("CARGO_PKG_VERSION")),
-            capabilities: caps::VIDEO_JPEG | caps::AUDIO_PCM | caps::AUDIO_OPUS | caps::ROTATION,
+            capabilities: caps::VIDEO_JPEG
+                | caps::AUDIO_PCM
+                | caps::AUDIO_OPUS
+                | caps::ROTATION
+                | caps::FOREGROUND
+                | caps::LAUNCH_APP
+                | caps::LIST_APPS
+                | caps::UI_TREE
+                | caps::EXIT_INFO
+                | caps::IP_CHECK
+                | caps::HTTP_LOCAL
+                | caps::TEXT_INPUT,
             aoa: AoaStrings::default(),
             hid: HidConfig::default(),
             stream: None,
@@ -98,6 +109,22 @@ pub enum State {
     /// `HELLO` отправлен, ждём ответ телефона.
     Connecting,
     Active,
+}
+
+/// Почему `Session::launch_app` не отправил команду.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchError {
+    /// Сессия не активна.
+    NotActive,
+    /// Телефон не умеет (`caps::LAUNCH_APP` не согласован).
+    Unsupported,
+    /// Некорректное имя пакета.
+    BadPackage,
+    /// Некорректный URL для `IP_CHECK` (только `https://`, см. `packet::valid_ip_check_url`).
+    BadUrl,
+    /// Некорректный запрос `HTTP_LOCAL` (метод, заголовки или тело, см. `packet::HttpLocalReq::check`) или текст
+    /// `TEXT_INPUT` (пустой, длиннее 16 КБ или с `\0`, см. `packet::valid_text_input`).
+    BadRequest,
 }
 
 #[derive(Debug)]
@@ -384,10 +411,19 @@ impl Session {
     }
 
     /// Просит телефон изменить параметры потока. Телефон ответит новым `DisplayInfo`.
+    /// Настройки запоминаются: после переподключения телефон получит последние.
     pub fn set_stream(&mut self, settings: SetStream) {
+        self.cfg.stream = Some(settings);
         if self.state == State::Active {
             self.send_packet(settings.to_packet());
         }
+    }
+
+    /// Включить или выключить видео и звук и сменить предел частоты, не трогая размер и качество кадра,
+    /// заданные раньше (`set_initial_stream`/`set_stream`). Так `InputCmd::SetStream` не сбрасывает их.
+    pub fn set_stream_switches(&mut self, video: bool, audio: bool, max_fps: u8) {
+        let base = self.cfg.stream.unwrap_or_default();
+        self.set_stream(SetStream { video, audio, max_fps, ..base });
     }
 
     /// Просит телефон прислать текущее содержимое экрана.
@@ -402,6 +438,157 @@ impl Session {
         if self.state == State::Active {
             self.send_packet(wake_packet());
         }
+    }
+
+    /// Просит телефон открыть приложение (`LAUNCH_APP`, PROTOCOL.md §5 «Запуск приложения»). Ответ придёт
+    /// событием `Status` с кодом 18 и `detail` = `"<request_id> <результат>"`.
+    /// Ошибка — сессия не активна, телефон не согласовал `caps::LAUNCH_APP` или имя пакета некорректно.
+    pub fn launch_app(&mut self, request_id: u32, package: &str) -> Result<(), LaunchError> {
+        if self.state != State::Active {
+            return Err(LaunchError::NotActive);
+        }
+        if self.negotiated_caps & caps::LAUNCH_APP == 0 {
+            return Err(LaunchError::Unsupported);
+        }
+        if !valid_package(package) {
+            return Err(LaunchError::BadPackage);
+        }
+        let p = LaunchApp { request_id, package: package.to_string() }.to_packet();
+        self.send_packet(p);
+        Ok(())
+    }
+
+    /// Просит телефон прислать список приложений с главным экраном (`LIST_APPS`). Ответ придёт событием `Status`
+    /// с кодом 19 и `detail` = `"<request_id> <JSON>"`. Ошибка — сессия не активна или `caps::LIST_APPS` не согласован.
+    pub fn list_apps(&mut self, request_id: u32) -> Result<(), LaunchError> {
+        if self.state != State::Active {
+            return Err(LaunchError::NotActive);
+        }
+        if self.negotiated_caps & caps::LIST_APPS == 0 {
+            return Err(LaunchError::Unsupported);
+        }
+        self.send_packet(list_apps_packet(request_id));
+        Ok(())
+    }
+
+    /// Выполнить запрос к приложению на телефоне. Ответ всегда придёт событием `Status` (см. [`crate::link::AppRequest`]):
+    /// если запрос не ушёл, сессия сама кладёт `Status` с `"<request> error <причина>"`.
+    pub fn app_request(&mut self, req: &crate::link::AppRequest) {
+        use crate::link::AppRequest as R;
+        let r = match req {
+            R::LaunchApp { request, package } => self.launch_app(*request, package),
+            R::ListApps { request } => self.list_apps(*request),
+            R::UiDump { request } => self.ui_dump(*request),
+            R::ExitInfo { request, since_ms, package } => self.exit_info(*request, *since_ms, package),
+            R::IpCheck { request, url } => self.ip_check(*request, url),
+            R::HttpLocal { request, method, url, headers, body, timeout_ms } => {
+                self.http_local(&HttpLocalReq {
+                    request_id: *request,
+                    method: method.clone(),
+                    url: url.clone(),
+                    headers: headers.clone(),
+                    body: body.clone(),
+                    timeout_ms: *timeout_ms,
+                })
+            }
+            R::TypeText { request, text } => {
+                self.text_input(&TextInputReq { request_id: *request, text: text.clone() })
+            }
+        };
+        if let Err(e) = r {
+            let why = match e {
+                LaunchError::NotActive => "not_active",
+                LaunchError::Unsupported => "unsupported",
+                LaunchError::BadPackage => "invalid_package",
+                LaunchError::BadUrl => "invalid_url",
+                LaunchError::BadRequest => "invalid_request",
+            };
+            let part = if matches!(req, R::UiDump { .. }) { "1/1 " } else { "" };
+            let detail = format!("{} {part}error {why}", req.request());
+            self.events.push_back(Event::Status(Status { code: req.reply_code(), detail }));
+        }
+    }
+
+    /// Просит телефон прислать элементы экрана (`UI_DUMP`). Ответ придёт событиями `Status` с кодом 20
+    /// (`"<request_id> <i>/<n> <часть>"`). Ошибка — сессия не активна или `caps::UI_TREE` не согласован.
+    pub fn ui_dump(&mut self, request_id: u32) -> Result<(), LaunchError> {
+        if self.state != State::Active {
+            return Err(LaunchError::NotActive);
+        }
+        if self.negotiated_caps & caps::UI_TREE == 0 {
+            return Err(LaunchError::Unsupported);
+        }
+        self.send_packet(ui_dump_packet(request_id));
+        Ok(())
+    }
+
+    /// Просит телефон прислать причины завершения процессов приложения после `since_ms` (`EXIT_INFO`). Ответ —
+    /// событие `Status` с кодом 22. Ошибка — сессия не активна, `caps::EXIT_INFO` не согласован или имя пакета неверно.
+    pub fn exit_info(&mut self, request_id: u32, since_ms: u64, package: &str) -> Result<(), LaunchError> {
+        if self.state != State::Active {
+            return Err(LaunchError::NotActive);
+        }
+        if self.negotiated_caps & caps::EXIT_INFO == 0 {
+            return Err(LaunchError::Unsupported);
+        }
+        if !valid_package(package) {
+            return Err(LaunchError::BadPackage);
+        }
+        self.send_packet(ExitInfoReq { request_id, since_ms, package: package.to_string() }.to_packet());
+        Ok(())
+    }
+
+    /// Просит телефон сделать HTTPS GET по своей сети по умолчанию (`IP_CHECK`) — внешний IP телефона. Ответ придёт
+    /// событием `Status` с кодом 23 и `detail` = `"<request_id> <JSON>"`. Ошибка — сессия не активна, `caps::IP_CHECK`
+    /// не согласован или URL некорректен.
+    pub fn ip_check(&mut self, request_id: u32, url: &str) -> Result<(), LaunchError> {
+        if self.state != State::Active {
+            return Err(LaunchError::NotActive);
+        }
+        if self.negotiated_caps & caps::IP_CHECK == 0 {
+            return Err(LaunchError::Unsupported);
+        }
+        if !valid_ip_check_url(url) {
+            return Err(LaunchError::BadUrl);
+        }
+        self.send_packet(IpCheckReq { request_id, url: url.to_string() }.to_packet());
+        Ok(())
+    }
+
+    /// Просит телефон ввести текст в поле с курсором (`TEXT_INPUT`). Ответ придёт событием `Status` с кодом 25 и
+    /// `detail` = `"<request_id> <JSON>"`; при `"method":"clipboard"` текст только в буфере обмена — нажать Ctrl+V
+    /// должен хост. Ошибка — сессия не активна, `caps::TEXT_INPUT` не согласован или текст некорректен (`BadRequest`).
+    pub fn text_input(&mut self, req: &TextInputReq) -> Result<(), LaunchError> {
+        if self.state != State::Active {
+            return Err(LaunchError::NotActive);
+        }
+        if self.negotiated_caps & caps::TEXT_INPUT == 0 {
+            return Err(LaunchError::Unsupported);
+        }
+        if !req.valid() {
+            return Err(LaunchError::BadRequest);
+        }
+        self.send_packet(req.to_packet());
+        Ok(())
+    }
+
+    /// Просит телефон выполнить HTTP-запрос к устройству своей локальной Wi-Fi-сети (`HTTP_LOCAL`), например к админке
+    /// роутера. Ответ придёт событием `Status` с кодом 24 и `detail` = `"<request_id> <JSON>"`. Ошибка — сессия не
+    /// активна, `caps::HTTP_LOCAL` не согласован, URL (`BadUrl`) или метод/заголовки/тело (`BadRequest`) некорректны.
+    pub fn http_local(&mut self, req: &HttpLocalReq) -> Result<(), LaunchError> {
+        if self.state != State::Active {
+            return Err(LaunchError::NotActive);
+        }
+        if self.negotiated_caps & caps::HTTP_LOCAL == 0 {
+            return Err(LaunchError::Unsupported);
+        }
+        match req.check() {
+            Ok(()) => {}
+            Err(HttpLocalInvalid::Url) => return Err(LaunchError::BadUrl),
+            Err(HttpLocalInvalid::Request) => return Err(LaunchError::BadRequest),
+        }
+        self.send_packet(req.to_packet());
+        Ok(())
     }
 
     // ----- команды ввода (PROTOCOL.md §8) -----

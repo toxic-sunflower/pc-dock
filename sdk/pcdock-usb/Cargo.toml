@@ -10,6 +10,7 @@ publish = false
 pcdock-core = { path = "../pcdock-core" }
 rusb = "0.9"
 
-# Windows: libusb собирается из исходников (системной библиотеки там нет).
-[target.'cfg(windows)'.dependencies]
+# Windows и macOS: libusb собирается из исходников и линкуется статически (в Windows системной библиотеки нет; в macOS
+# Homebrew-libusb есть не у всех, а подписанное приложение чужую библиотеку не загрузит — разные Team ID).
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 rusb = { version = "0.9", features = ["vendored"] }

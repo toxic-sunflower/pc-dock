@@ -19,7 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use pcdock_core::input::{DeviceKind, MouseButton, TouchPhase};
-use pcdock_core::link::{InputCmd, PhoneId, PhoneState};
+use pcdock_core::link::{AppRequest, InputCmd, PhoneId, PhoneState};
 use pcdock_farm::{Farm, FarmEvent};
 use pcdock_net::{Handler, Hub};
 use serde_json::{json, Value};
@@ -51,6 +51,8 @@ struct Transfer {
 #[derive(Default)]
 pub struct ClientState {
     watches: HashMap<PhoneId, Watch>,
+    /// Телефоны, у которых клиент спрашивал приложение (`LaunchApp`…): `Status` от них идёт ему и без `Watch`.
+    apps: std::collections::HashSet<PhoneId>,
     transfers: HashMap<u32, Transfer>,
 }
 
@@ -335,11 +337,59 @@ impl Handler<ClientState> for Handle {
                     Err(e) => fail(e),
                 }
             }
+            ClientMsg::Pin { spec } => {
+                let r = pcdock_farm::PhoneSpec::parse(&spec)
+                    .and_then(|s| self.shared.daemon.lock().unwrap().pin(s));
+                match r {
+                    Ok(()) => {
+                        if id.is_some() {
+                            reply(ServerMsg::Ok);
+                        }
+                    }
+                    Err(e) => fail(e),
+                }
+            }
+            ClientMsg::Unpin { spec } => {
+                let r = pcdock_farm::PhoneSpec::parse(&spec)
+                    .and_then(|s| self.shared.daemon.lock().unwrap().unpin(&s));
+                match r {
+                    Ok(_) => {
+                        if id.is_some() {
+                            reply(ServerMsg::Ok);
+                        }
+                    }
+                    Err(e) => fail(e),
+                }
+            }
+            ClientMsg::AppEvents { phone, on } => {
+                if !self.shared.daemon.lock().unwrap().phones().contains(&phone) {
+                    return fail(format!("нет трубки {phone}"));
+                }
+                hub.with_clients(|clients| {
+                    if let Some(c) = clients.get_mut(&client) {
+                        if on {
+                            c.data.apps.insert(phone);
+                        } else {
+                            c.data.apps.remove(&phone);
+                        }
+                    }
+                });
+                if id.is_some() {
+                    reply(ServerMsg::Ok);
+                }
+            }
             other => {
                 let (phone, cmd) = match map_input(other) {
                     Ok(v) => v,
                     Err(detail) => return fail(detail),
                 };
+                if matches!(cmd, InputCmd::App(_)) {
+                    hub.with_clients(|clients| {
+                        if let Some(c) = clients.get_mut(&client) {
+                            c.data.apps.insert(phone);
+                        }
+                    });
+                }
                 let result = self.shared.daemon.lock().unwrap().command(phone, cmd);
                 match result {
                     Ok(()) => {
@@ -583,6 +633,14 @@ fn route(hub: &Hub<ClientState>, ev: FarmEvent) {
             let (_, msg) = map_daemon_event(ev);
             hub.broadcast(|_| true, &to_value(&msg));
         }
+        // Ответы приложения и его сообщения (передний план, «экран изменился») — ещё и тем, кто спрашивал приложение.
+        ev @ FarmEvent::Status { .. } => {
+            let (phone, msg) = map_daemon_event(ev);
+            hub.broadcast(
+                |c| c.data.watches.contains_key(&phone) || c.data.apps.contains(&phone),
+                &to_value(&msg),
+            );
+        }
         other => {
             let (phone, msg) = map_daemon_event(other);
             hub.broadcast(|c| c.data.watches.contains_key(&phone), &to_value(&msg));
@@ -694,6 +752,31 @@ fn map_input(msg: ClientMsg) -> Result<(PhoneId, InputCmd), String> {
         ClientMsg::SetStream { phone, video, audio } => {
             (phone, InputCmd::SetStream { video, audio, max_fps: 0 })
         }
+        ClientMsg::LaunchApp { phone, request, package } => {
+            (phone, InputCmd::App(AppRequest::LaunchApp { request, package }))
+        }
+        ClientMsg::ListApps { phone, request } => (phone, InputCmd::App(AppRequest::ListApps { request })),
+        ClientMsg::UiDump { phone, request } => (phone, InputCmd::App(AppRequest::UiDump { request })),
+        ClientMsg::ExitInfo { phone, request, since_ms, package } => {
+            (phone, InputCmd::App(AppRequest::ExitInfo { request, since_ms, package }))
+        }
+        ClientMsg::IpCheck { phone, request, url } => {
+            (phone, InputCmd::App(AppRequest::IpCheck { request, url }))
+        }
+        ClientMsg::HttpLocal { phone, request, method, url, headers, body, timeout_ms } => (
+            phone,
+            InputCmd::App(AppRequest::HttpLocal {
+                request,
+                method,
+                url,
+                headers: headers.into_iter().collect(),
+                body,
+                timeout_ms,
+            }),
+        ),
+        ClientMsg::TypeText { phone, request, text } => {
+            (phone, InputCmd::App(AppRequest::TypeText { request, text }))
+        }
         ClientMsg::Auth { .. }
         | ClientMsg::List
         | ClientMsg::Watch { .. }
@@ -704,6 +787,9 @@ fn map_input(msg: ClientMsg) -> Result<(PhoneId, InputCmd), String> {
         | ClientMsg::FileList { .. }
         | ClientMsg::FileDelete { .. }
         | ClientMsg::FileCancel { .. }
-        | ClientMsg::SetTransport { .. } => return Err(bad("не команда ввода")),
+        | ClientMsg::SetTransport { .. }
+        | ClientMsg::AppEvents { .. }
+        | ClientMsg::Pin { .. }
+        | ClientMsg::Unpin { .. } => return Err(bad("не команда ввода")),
     })
 }

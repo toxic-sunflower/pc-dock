@@ -304,3 +304,307 @@ fn data_is_ignored_when_session_is_not_started() {
     feed(&mut s, 0, &[phone_hello()]);
     assert!(events(&mut s).is_empty());
 }
+
+#[test]
+fn launch_app_only_when_both_sides_agree() {
+    // Старый телефон (без бита LAUNCH_APP) — команда не уходит
+    let mut s = active_session();
+    assert_eq!(s.launch_app(1, "com.android.settings"), Err(LaunchError::Unsupported));
+    assert!(drain(&mut s).0.is_empty());
+
+    // Хост и телефон умеют — уходит LAUNCH_APP, ответ STATUS 18 доходит событием
+    let cfg = Config { capabilities: Config::default().capabilities | caps::LAUNCH_APP, ..Config::default() };
+    let mut s = Session::new(cfg);
+    assert_eq!(s.launch_app(1, "com.android.settings"), Err(LaunchError::NotActive));
+    s.start(0);
+    let hello = Hello {
+        version_max: 2,
+        version_min: 2,
+        capabilities: caps::VIDEO_JPEG | caps::LAUNCH_APP,
+        role: Role::Device,
+        name: "fake-phone/2".into(),
+    };
+    feed(&mut s, 10, &[hello.to_packet()]);
+    drain(&mut s);
+    events(&mut s);
+    assert_eq!(s.launch_app(7, "com.x;reboot"), Err(LaunchError::BadPackage));
+    assert_eq!(s.launch_app(7, "com.android.settings"), Ok(()));
+    let (streams, _) = drain(&mut s);
+    assert_eq!(streams.len(), 1);
+    let mut r = PacketReader::new();
+    r.push(&streams[0]);
+    let p = r.next_packet().unwrap();
+    assert_eq!(p.ptype, PacketType::LaunchApp);
+    assert_eq!(
+        LaunchApp::from_payload(&p.payload).unwrap(),
+        LaunchApp { request_id: 7, package: "com.android.settings".into() }
+    );
+    feed(&mut s, 20, &[Status { code: 18, detail: "7 ok".into() }.to_packet()]);
+    assert!(events(&mut s).contains(&Event::Status(Status { code: 18, detail: "7 ok".into() })));
+    // Список приложений этот телефон не согласовал
+    assert_eq!(s.list_apps(8), Err(LaunchError::Unsupported));
+}
+
+#[test]
+fn list_apps_request_when_agreed() {
+    let cfg = Config { capabilities: Config::default().capabilities | caps::LIST_APPS, ..Config::default() };
+    let mut s = Session::new(cfg);
+    assert_eq!(s.list_apps(1), Err(LaunchError::NotActive));
+    s.start(0);
+    let hello = Hello {
+        version_max: 2,
+        version_min: 2,
+        capabilities: caps::VIDEO_JPEG | caps::LIST_APPS,
+        role: Role::Device,
+        name: "p".into(),
+    };
+    feed(&mut s, 10, &[hello.to_packet()]);
+    drain(&mut s);
+    assert_eq!(s.list_apps(0x0A0B_0C0D), Ok(()));
+    let (streams, _) = drain(&mut s);
+    assert_eq!(streams, vec![vec![b'P', b'D', 0x44, 0, 0, 0, 0, 4, 0x0A, 0x0B, 0x0C, 0x0D]]);
+}
+
+#[test]
+fn ui_dump_and_exit_info_only_when_agreed() {
+    // Старый телефон (без битов 9 и 10) — команды не уходят
+    let mut s = active_session();
+    assert_eq!(s.ui_dump(1), Err(LaunchError::Unsupported));
+    assert_eq!(s.exit_info(1, 0, "com.example.shop"), Err(LaunchError::Unsupported));
+    assert!(drain(&mut s).0.is_empty());
+
+    let cfg = Config {
+        capabilities: Config::default().capabilities | caps::UI_TREE | caps::EXIT_INFO,
+        ..Config::default()
+    };
+    let mut s = Session::new(cfg);
+    assert_eq!(s.ui_dump(1), Err(LaunchError::NotActive));
+    s.start(0);
+    let hello = Hello {
+        version_max: 2,
+        version_min: 2,
+        capabilities: caps::VIDEO_JPEG | caps::UI_TREE | caps::EXIT_INFO,
+        role: Role::Device,
+        name: "p".into(),
+    };
+    feed(&mut s, 10, &[hello.to_packet()]);
+    drain(&mut s);
+    events(&mut s);
+    assert_eq!(s.ui_dump(5), Ok(()));
+    assert_eq!(s.exit_info(6, 1_700_000_000_000, "com.x;reboot"), Err(LaunchError::BadPackage));
+    assert_eq!(s.exit_info(6, 1_700_000_000_000, "com.example.shop"), Ok(()));
+    let (streams, _) = drain(&mut s);
+    assert_eq!(streams.len(), 2);
+    assert_eq!(streams[0], vec![b'P', b'D', 0x45, 0, 0, 0, 0, 4, 0, 0, 0, 5]);
+    let mut r = PacketReader::new();
+    r.push(&streams[1]);
+    let p = r.next_packet().unwrap();
+    assert_eq!(p.ptype, PacketType::ExitInfo);
+    assert_eq!(
+        ExitInfoReq::from_payload(&p.payload).unwrap(),
+        ExitInfoReq { request_id: 6, since_ms: 1_700_000_000_000, package: "com.example.shop".into() }
+    );
+    // Ответы — обычные STATUS
+    feed(&mut s, 20, &[Status { code: 20, detail: "5 1/1 no_service".into() }.to_packet()]);
+    assert!(events(&mut s).contains(&Event::Status(Status { code: 20, detail: "5 1/1 no_service".into() })));
+}
+
+#[test]
+fn ip_check_only_when_agreed() {
+    // Старый телефон (без бита 11) — команда не уходит
+    let mut s = active_session();
+    assert_eq!(s.ip_check(1, "https://pynelo.mpd-system.top/api/v1/ip"), Err(LaunchError::Unsupported));
+    assert!(drain(&mut s).0.is_empty());
+
+    let cfg = Config { capabilities: Config::default().capabilities | caps::IP_CHECK, ..Config::default() };
+    let mut s = Session::new(cfg);
+    assert_eq!(s.ip_check(1, "https://x.y/ip"), Err(LaunchError::NotActive));
+    s.start(0);
+    let hello = Hello {
+        version_max: 2,
+        version_min: 2,
+        capabilities: caps::VIDEO_JPEG | caps::IP_CHECK,
+        role: Role::Device,
+        name: "p".into(),
+    };
+    feed(&mut s, 10, &[hello.to_packet()]);
+    drain(&mut s);
+    events(&mut s);
+    assert_eq!(s.ip_check(2, "http://x.y/ip"), Err(LaunchError::BadUrl));
+    assert_eq!(s.ip_check(2, "https://a@x.y/ip"), Err(LaunchError::BadUrl));
+    assert!(drain(&mut s).0.is_empty(), "неверный URL не уходит");
+    assert_eq!(s.ip_check(7, "https://x.y/ip"), Ok(()));
+    let (streams, _) = drain(&mut s);
+    assert_eq!(streams.len(), 1);
+    let mut r = PacketReader::new();
+    r.push(&streams[0]);
+    let p = r.next_packet().unwrap();
+    assert_eq!(p.ptype, PacketType::IpCheck);
+    assert_eq!(
+        IpCheckReq::from_payload(&p.payload).unwrap(),
+        IpCheckReq { request_id: 7, url: "https://x.y/ip".into() }
+    );
+    // Ответ — обычный STATUS 23
+    let d = r#"7 {"ok":true,"code":200,"body":"{\"ip\":\"1.2.3.4\"}","transport":"cellular","ms":120}"#;
+    feed(&mut s, 20, &[Status { code: 23, detail: d.into() }.to_packet()]);
+    assert!(events(&mut s).contains(&Event::Status(Status { code: 23, detail: d.into() })));
+}
+
+#[test]
+fn http_local_only_when_agreed() {
+    use pcdock_core::link::AppRequest;
+    let req = |request: u32, url: &str| AppRequest::HttpLocal {
+        request,
+        method: "POST".into(),
+        url: url.into(),
+        headers: vec![("Content-Type".into(), "text/plain".into())],
+        body: "[cgi]".into(),
+        timeout_ms: 0,
+    };
+    // Хост просит бит 12 по умолчанию
+    assert_ne!(Config::default().capabilities & caps::HTTP_LOCAL, 0);
+
+    // Старый телефон (без бита 12) — команда не уходит, ответ «unsupported» кладёт сама сессия
+    let mut s = active_session();
+    s.app_request(&req(3, "http://192.168.1.1/cgi"));
+    assert!(drain(&mut s).0.is_empty());
+    assert!(
+        events(&mut s).contains(&Event::Status(Status { code: 24, detail: "3 error unsupported".into() }))
+    );
+
+    let mut s = Session::new(Config::default());
+    s.start(0);
+    let hello = Hello {
+        version_max: 2,
+        version_min: 2,
+        capabilities: caps::VIDEO_JPEG | caps::HTTP_LOCAL,
+        role: Role::Device,
+        name: "p".into(),
+    };
+    feed(&mut s, 10, &[hello.to_packet()]);
+    drain(&mut s);
+    events(&mut s);
+
+    // Адрес не из локальной сети и неверный метод — не уходят
+    s.app_request(&req(4, "http://8.8.8.8/"));
+    s.app_request(&AppRequest::HttpLocal {
+        request: 5,
+        method: "DELETE".into(),
+        url: "http://192.168.1.1/".into(),
+        headers: vec![],
+        body: String::new(),
+        timeout_ms: 0,
+    });
+    assert!(drain(&mut s).0.is_empty(), "неверный запрос не уходит");
+    let ev = events(&mut s);
+    assert!(ev.contains(&Event::Status(Status { code: 24, detail: "4 error invalid_url".into() })), "{ev:?}");
+    assert!(
+        ev.contains(&Event::Status(Status { code: 24, detail: "5 error invalid_request".into() })),
+        "{ev:?}"
+    );
+
+    s.app_request(&req(7, "http://192.168.1.1/cgi?1"));
+    let (streams, _) = drain(&mut s);
+    assert_eq!(streams.len(), 1);
+    let mut r = PacketReader::new();
+    r.push(&streams[0]);
+    let p = r.next_packet().unwrap();
+    assert_eq!(p.ptype, PacketType::HttpLocal);
+    assert_eq!(
+        HttpLocalReq::split_payload(&p.payload).unwrap(),
+        (
+            7,
+            r#"{"method":"POST","url":"http://192.168.1.1/cgi?1","headers":{"Content-Type":"text/plain"},"body":"[cgi]","timeout_ms":10000}"#
+                .to_string()
+        )
+    );
+    // Ответ — обычный STATUS 24 (401 — тоже успех: роутер так отвечает на вход)
+    let d = r#"7 {"ok":true,"code":401,"body":"[error]0","headers":{"content-type":"text/plain"},"ms":35}"#;
+    feed(&mut s, 20, &[Status { code: 24, detail: d.into() }.to_packet()]);
+    assert!(events(&mut s).contains(&Event::Status(Status { code: 24, detail: d.into() })));
+}
+
+#[test]
+fn text_input_only_when_agreed() {
+    use pcdock_core::link::AppRequest;
+    let req = |request: u32, text: &str| AppRequest::TypeText { request, text: text.into() };
+    // Хост просит бит 13 по умолчанию
+    assert_ne!(Config::default().capabilities & caps::TEXT_INPUT, 0);
+
+    // Старый телефон (без бита 13) — команда не уходит, ответ «unsupported» кладёт сама сессия
+    let mut s = active_session();
+    s.app_request(&req(3, "Привет"));
+    assert!(drain(&mut s).0.is_empty());
+    assert!(
+        events(&mut s).contains(&Event::Status(Status { code: 25, detail: "3 error unsupported".into() }))
+    );
+
+    let mut s = Session::new(Config::default());
+    s.start(0);
+    let hello = Hello {
+        version_max: 2,
+        version_min: 2,
+        capabilities: caps::VIDEO_JPEG | caps::TEXT_INPUT,
+        role: Role::Device,
+        name: "p".into(),
+    };
+    feed(&mut s, 10, &[hello.to_packet()]);
+    drain(&mut s);
+    events(&mut s);
+
+    // Пустой и слишком длинный текст — не уходят
+    s.app_request(&req(4, ""));
+    s.app_request(&req(5, &"я".repeat(TEXT_INPUT_MAX)));
+    assert!(drain(&mut s).0.is_empty(), "неверный текст не уходит");
+    let ev = events(&mut s);
+    assert!(
+        ev.contains(&Event::Status(Status { code: 25, detail: "4 error invalid_request".into() })),
+        "{ev:?}"
+    );
+    assert!(
+        ev.contains(&Event::Status(Status { code: 25, detail: "5 error invalid_request".into() })),
+        "{ev:?}"
+    );
+
+    let text = "Подпись ✨ #тест\nвторая строка 👨‍👩‍👧";
+    s.app_request(&req(7, text));
+    let (streams, _) = drain(&mut s);
+    assert_eq!(streams.len(), 1);
+    let mut r = PacketReader::new();
+    r.push(&streams[0]);
+    let p = r.next_packet().unwrap();
+    assert_eq!(p.ptype, PacketType::TextInput);
+    assert_eq!(TextInputReq::decode(&p.payload).unwrap(), TextInputReq { request_id: 7, text: text.into() });
+    // Ответ — обычный STATUS 25
+    let d = r#"7 {"ok":true,"method":"paste","ms":40}"#;
+    feed(&mut s, 20, &[Status { code: 25, detail: d.into() }.to_packet()]);
+    assert!(events(&mut s).contains(&Event::Status(Status { code: 25, detail: d.into() })));
+}
+
+#[test]
+fn stream_switches_keep_size_and_quality() {
+    let mut s = Session::new(Config::default());
+    let base = SetStream {
+        video: false,
+        audio: false,
+        max_width: 1280,
+        max_height: 1280,
+        jpeg_quality: 80,
+        max_fps: 30,
+    };
+    s.set_initial_stream(base);
+    s.start(0);
+    feed(&mut s, 10, &[phone_hello(), display(0, 720, 1640).to_packet()]);
+    drain(&mut s);
+    s.set_stream_switches(true, false, 10);
+    let (streams, _) = drain(&mut s);
+    let mut r = PacketReader::new();
+    r.push(&streams.concat());
+    let p = r.next_packet().unwrap();
+    assert_eq!(p.ptype, PacketType::SetStream);
+    let st = SetStream::from_payload(&p.payload).unwrap();
+    assert_eq!(
+        (st.video, st.max_width, st.max_height, st.jpeg_quality, st.max_fps),
+        (true, 1280, 1280, 80, 10)
+    );
+}

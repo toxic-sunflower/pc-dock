@@ -1,16 +1,44 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- IP-адрес телефона для компьютера (PROTOCOL.md, IP_CHECK): тип сети по умолчанию и шлюз -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Пакет на переднем плане для хоста (PROTOCOL.md, STATUS 16). Даёт пользователь: «Доступ к истории использования» -->
+    <uses-permission
+        android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
+
+    <!-- Открыть приложение по команде хоста (PROTOCOL.md, LAUNCH_APP): с Android 10 запуск из фона разрешён только
+         с «Поверх других окон». Даёт пользователь в настройках (или pynelo через adb: appops SYSTEM_ALERT_WINDOW) -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- Причины падений тестируемого приложения (PROTOCOL.md, EXIT_INFO): для чужого пакета Android требует DUMP.
+         Выдать может только adb (pm grant com.device.media android.permission.DUMP) — pynelo делает это сам -->
+    <uses-permission
+        android:name="android.permission.DUMP"
+        tools:ignore="ProtectedPermissions" />
 
     <uses-feature android:name="android.hardware.usb.accessory" android:required="true" />
 
+    <!-- Android 11+: видеть приложения с главным экраном (getLaunchIntentForPackage для LAUNCH_APP) -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
+    <!-- usesCleartextTraffic: HTTP_LOCAL (PROTOCOL.md, возможность 12) ходит по http:// к устройствам локальной Wi-Fi-сети
+         (админка роутера); адреса — только IPv4 частных сетей, проверяет HttpLocal.validUrl. IP_CHECK — только https. -->
     <application
         android:label="Device Media"
+        android:usesCleartextTraffic="true"
         android:theme="@style/Theme.AppCompat.Light.NoActionBar">
 
         <activity
@@ -35,6 +63,30 @@
             android:name=".ScreenCaptureService"
             android:foregroundServiceType="mediaProjection"
             android:exported="false" />
+
+        <!-- Элементы экрана для компьютера (UI_DUMP): служба специальных возможностей, только чтение окна -->
+        <service
+            android:name=".UiTreeService"
+            android:exported="true"
+            android:label="@string/ui_tree_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/ui_tree_accessibility" />
+        </service>
+
+        <!-- IP-адрес телефона без pc-dock: adb shell am broadcast … (DUMP есть только у adb shell и системы) -->
+        <receiver
+            android:name=".IpCheckReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="com.device.media.IP_CHECK" />
+            </intent-filter>
+        </receiver>
 
     </application>
 </manifest>

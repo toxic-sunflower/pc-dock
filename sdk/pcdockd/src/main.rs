@@ -16,6 +16,10 @@ struct Args {
     #[arg(long, short = 'a')]
     auto: bool,
 
+    /// Стартовать без телефонов: их закрепляет клиент командой `Pin`.
+    #[arg(long)]
+    manual: bool,
+
     /// Закреплённый телефон: принимается всегда. Формат: `usb` (любой USB-телефон),
     /// `usb:1-2.3` (на этом USB-порту), `usb:СЕРИЙНИК`, `adb:СЕРИЙНИК`, `serial:ПУТЬ`.
     /// Без --auto это «только эти». Можно несколько раз.
@@ -148,7 +152,7 @@ fn main() {
             }
         }
     }
-    if !args.auto && pinned.is_empty() {
+    if !args.auto && pinned.is_empty() && !args.manual {
         log::error!("нужен --auto или хотя бы один --phone (см. --help)");
         std::process::exit(2);
     }
@@ -168,6 +172,7 @@ fn main() {
         video: args.video,
         audio: args.audio,
         auto: args.auto,
+        manual: args.manual,
         except: args.except.clone(),
         pinned,
         usb: !args.no_usb,

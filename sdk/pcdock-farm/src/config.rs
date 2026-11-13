@@ -24,6 +24,8 @@ pub struct FarmConfig {
     pub except: Vec<String>,
     /// Закреплённые телефоны: принимаются всегда, транспорт задан правилом.
     pub pinned: Vec<PhoneSpec>,
+    /// Разрешить старт без автообнаружения и без закреплённых: телефоны закрепляет клиент на ходу (`Farm::pin`).
+    pub manual: bool,
     /// Какие семейства искать.
     pub usb: bool,
     pub adb: bool,
@@ -58,6 +60,7 @@ impl Default for FarmConfig {
             auto: true,
             except: Vec::new(),
             pinned: Vec::new(),
+            manual: false,
             usb: true,
             adb: true,
             serial: false,
@@ -185,7 +188,7 @@ impl Farm {
     /// Ферма по настройке. Возвращает предупреждения запуска (например, USB-обнаружение не встало):
     /// ферма при этом работает с тем, что удалось поднять.
     pub fn from_config(cfg: FarmConfig) -> Result<(Farm, Vec<String>), String> {
-        if !cfg.auto && cfg.pinned.is_empty() {
+        if !cfg.auto && cfg.pinned.is_empty() && !cfg.manual {
             return Err("нужно автообнаружение или хотя бы один закреплённый телефон".into());
         }
         let mut warnings = Vec::new();

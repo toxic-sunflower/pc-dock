@@ -60,6 +60,9 @@ class ScreenCaptureService : Service(), HostLink.Listener {
         private const val HOST_SILENT_MS = 6000L
         private const val IDLE_FRAME_INTERVAL_MS = 1000L
         private const val NAME = "pcdock-android/1.0"
+        /** Опрос переднего плана для хоста (STATUS 16): смена — сразу, иначе повтор раз в секунду */
+        private const val FOREGROUND_POLL_MS = 500L
+        private const val FOREGROUND_REPEAT_MS = 1000L
     }
 
     private class Layout(
@@ -130,6 +133,30 @@ class ScreenCaptureService : Service(), HostLink.Listener {
     private var framesSent = 0
     private var framesThrottled = 0
     private var connects = 0
+
+    // Передний план для хоста (PROTOCOL.md: CAP_FOREGROUND, STATUS 16/17) — только если хост попросил в HELLO
+    private var foregroundWatch: ForegroundWatch? = null
+    private var hostWantsForeground = false
+    private var foregroundSent: String? = null
+    private var foregroundSentAt = 0L
+    // Запуск приложений по команде хоста (CAP_LAUNCH_APP, LAUNCH_APP → STATUS 18) — только если хост поставил бит в HELLO
+    private var hostWantsLaunch = false
+    // Список приложений по команде хоста (CAP_LIST_APPS, LIST_APPS → STATUS 19)
+    private var hostWantsApps = false
+    // Элементы экрана (CAP_UI_TREE, UI_DUMP → STATUS 20, «экран изменился» → STATUS 21) и падения (CAP_EXIT_INFO → STATUS 22)
+    @Volatile private var hostWantsUi = false
+    @Volatile private var hostWantsExit = false
+    // IP-адрес телефона (CAP_IP_CHECK, IP_CHECK → STATUS 23)
+    @Volatile private var hostWantsIp = false
+    private val ipExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "ip-check") }
+    // HTTP в локальной Wi-Fi-сети (CAP_HTTP_LOCAL, HTTP_LOCAL → STATUS 24): свой поток — медленный роутер не задерживает IP_CHECK
+    @Volatile private var hostWantsHttp = false
+    private val httpExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "http-local") }
+    // Ввод текста (CAP_TEXT_INPUT, TEXT_INPUT → STATUS 25): по одному, по порядку, не в потоке захвата
+    @Volatile private var hostWantsText = false
+    private val textExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "text-input") }
+    // Дампы и причины завершения — по одному, не в потоке захвата (обход дерева — межпроцессные вызовы)
+    private val uiExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "ui-tree") }
 
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -338,6 +365,18 @@ class ScreenCaptureService : Service(), HostLink.Listener {
                 }
             }
         }, 5000)
+        h.postDelayed(object : Runnable {
+            override fun run() {
+                try {
+                    if (!running) return
+                    reportForeground(false)
+                } catch (e: Throwable) {
+                    Log.e(TAG, "Сбой опроса переднего плана", e)
+                } finally {
+                    if (running) h.postDelayed(this, FOREGROUND_POLL_MS)
+                }
+            }
+        }, FOREGROUND_POLL_MS)
     }
 
     /** Проекция умерла (система/пользователь): сервис и USB живут, ждём нового разрешения. */
@@ -752,6 +791,15 @@ class ScreenCaptureService : Service(), HostLink.Listener {
         val l = Link(descriptor, this)
         link = l
         sessionActive = false
+        hostWantsForeground = false
+        hostWantsLaunch = false
+        hostWantsApps = false
+        hostWantsUi = false
+        hostWantsExit = false
+        hostWantsIp = false
+        hostWantsHttp = false
+        hostWantsText = false
+        stopUiChanges()
         stream = StreamConfig()
         Log.d(TAG, "USB подключён (#$connects): ${accessory.manufacturer} ${accessory.model}, жду HELLO от ПК")
         l.start()
@@ -775,6 +823,15 @@ class ScreenCaptureService : Service(), HostLink.Listener {
                 releaseDockWakeLock()
                 link = null
                 sessionActive = false
+                hostWantsForeground = false
+                hostWantsLaunch = false
+                hostWantsApps = false
+                hostWantsUi = false
+                hostWantsExit = false
+                hostWantsIp = false
+                hostWantsHttp = false
+                hostWantsText = false
+                stopUiChanges()
             }
         }
     }
@@ -836,6 +893,139 @@ class ScreenCaptureService : Service(), HostLink.Listener {
                 acquireTimedWakeLock()
             }
 
+            Proto.T_LAUNCH_APP -> {
+                reactivateIfPaused("LAUNCH_APP")
+                val cmd = Messages.parseLaunchApp(p.payload) ?: return
+                // Хост не просил эту возможность в HELLO — команду не выполняем (ответ всё равно даём)
+                val result = if (hostWantsLaunch) AppLauncher.launch(this, cmd.packageName) else AppLauncher.ERROR
+                Log.d(TAG, "LAUNCH_APP #${cmd.requestId}: ${cmd.packageName.take(255)} → $result")
+                l.sendControl(Messages.status(Proto.STATUS_LAUNCH_RESULT, "${cmd.requestId} $result").encode())
+                // Передний план — вскоре после запуска: хост ждёт смены приложения
+                if (result == AppLauncher.OK) handler?.postDelayed({
+                    try {
+                        if (running) reportForeground(false)
+                    } catch (e: Throwable) {
+                        Log.e(TAG, "Сбой отчёта переднего плана после LAUNCH_APP", e)
+                    }
+                }, 300)
+            }
+
+            Proto.T_LIST_APPS -> {
+                reactivateIfPaused("LIST_APPS")
+                val id = Messages.parseListApps(p.payload) ?: return
+                if (!hostWantsApps) {
+                    l.sendControl(Messages.status(Proto.STATUS_APP_LIST, "$id []").encode())
+                    return
+                }
+                // Подписи и значки грузятся заметное время — не в потоке захвата
+                Thread({
+                    val json = try {
+                        AppLauncher.listApps(this)
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "LIST_APPS: $e")
+                        "[]"
+                    }
+                    l.sendControl(Messages.status(Proto.STATUS_APP_LIST, "$id $json").encode())
+                }, "list-apps").start()
+            }
+
+            Proto.T_UI_DUMP -> {
+                reactivateIfPaused("UI_DUMP")
+                val id = Messages.parseUiDump(p.payload) ?: return
+                if (!hostWantsUi) {
+                    l.sendControl(Messages.status(Proto.STATUS_UI_DUMP, "$id 1/1 error not_negotiated").encode())
+                    return
+                }
+                uiExecutor.execute {
+                    val answer = try {
+                        UiTreeService.dump(this)
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "UI_DUMP: $e")
+                        "error " + e.javaClass.simpleName
+                    }
+                    val parts = UiTreeService.chunks(answer)
+                    for ((i, part) in parts.withIndex()) {
+                        l.sendControl(Messages.status(Proto.STATUS_UI_DUMP, "$id ${i + 1}/${parts.size} $part").encode())
+                    }
+                }
+            }
+
+            Proto.T_EXIT_INFO -> {
+                reactivateIfPaused("EXIT_INFO")
+                val cmd = Messages.parseExitInfo(p.payload) ?: return
+                if (!hostWantsExit) {
+                    l.sendControl(Messages.status(Proto.STATUS_EXIT_INFO, "${cmd.requestId} ${ExitInfo.UNSUPPORTED}").encode())
+                    return
+                }
+                uiExecutor.execute {
+                    val answer = try {
+                        ExitInfo.query(this, cmd.packageName, cmd.sinceMs)
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "EXIT_INFO: $e")
+                        "[]"
+                    }
+                    l.sendControl(Messages.status(Proto.STATUS_EXIT_INFO, "${cmd.requestId} $answer").encode())
+                }
+            }
+
+            Proto.T_IP_CHECK -> {
+                reactivateIfPaused("IP_CHECK")
+                val cmd = Messages.parseIpCheck(p.payload) ?: return
+                if (!hostWantsIp) {
+                    l.sendControl(Messages.status(Proto.STATUS_IP_CHECK, "${cmd.requestId} ${IpCheck.error("not_negotiated", "none", 0)}").encode())
+                    return
+                }
+                // Сеть — не в потоке захвата и не в очереди дампов экрана
+                ipExecutor.execute {
+                    val answer = try {
+                        IpCheck.run(this, cmd.url)
+                    } catch (e: Throwable) {
+                        IpCheck.error("io: " + e.javaClass.simpleName, "none", 0)
+                    }
+                    Log.d(TAG, "IP_CHECK #${cmd.requestId}: $answer")
+                    l.sendControl(Messages.status(Proto.STATUS_IP_CHECK, "${cmd.requestId} $answer").encode())
+                }
+            }
+
+            Proto.T_HTTP_LOCAL -> {
+                reactivateIfPaused("HTTP_LOCAL")
+                val cmd = Messages.parseHttpLocal(p.payload) ?: return
+                if (!hostWantsHttp) {
+                    l.sendControl(Messages.status(Proto.STATUS_HTTP_LOCAL, "${cmd.requestId} ${HttpLocal.error("not_negotiated", 0)}").encode())
+                    return
+                }
+                // Сеть — не в потоке захвата
+                httpExecutor.execute {
+                    val answer = try {
+                        HttpLocal.run(this, cmd.json)
+                    } catch (e: Throwable) {
+                        HttpLocal.error("io: " + e.javaClass.simpleName, 0)
+                    }
+                    Log.d(TAG, "HTTP_LOCAL #${cmd.requestId}: ${answer.take(200)}")
+                    l.sendControl(Messages.status(Proto.STATUS_HTTP_LOCAL, "${cmd.requestId} $answer").encode())
+                }
+            }
+
+            Proto.T_TEXT_INPUT -> {
+                reactivateIfPaused("TEXT_INPUT")
+                val cmd = Messages.parseTextInput(p.payload) ?: return
+                if (!hostWantsText) {
+                    l.sendControl(Messages.status(Proto.STATUS_TEXT_INPUT, "${cmd.requestId} ${TextInput.error("not_negotiated", 0)}").encode())
+                    return
+                }
+                // Буфер обмена — в главном потоке, действия службы — межпроцессные вызовы: не в потоке захвата
+                textExecutor.execute {
+                    val answer = try {
+                        TextInput.run(this, cmd.bytes)
+                    } catch (e: Throwable) {
+                        TextInput.error("error: " + e.javaClass.simpleName, 0)
+                    }
+                    // Сам текст в журнал не пишется
+                    Log.d(TAG, "TEXT_INPUT #${cmd.requestId} (${cmd.bytes.size} байт): $answer")
+                    l.sendControl(Messages.status(Proto.STATUS_TEXT_INPUT, "${cmd.requestId} $answer").encode())
+                }
+            }
+
             else -> {} // PONG и неизвестные типы пропускаем
         }
     }
@@ -856,8 +1046,18 @@ class ScreenCaptureService : Service(), HostLink.Listener {
         sessionActive = true
         stream = StreamConfig()
         relayout("HELLO")
-        var caps = Proto.CAP_VIDEO_JPEG or Proto.CAP_ROTATION
+        var caps = Proto.CAP_VIDEO_JPEG or Proto.CAP_ROTATION or Proto.CAP_FOREGROUND or Proto.CAP_LAUNCH_APP or Proto.CAP_LIST_APPS or
+            Proto.CAP_UI_TREE or Proto.CAP_EXIT_INFO or Proto.CAP_IP_CHECK or Proto.CAP_HTTP_LOCAL or Proto.CAP_TEXT_INPUT
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) caps = caps or Proto.CAP_AUDIO_PCM
+        hostWantsForeground = hello.capabilities and Proto.CAP_FOREGROUND != 0
+        hostWantsLaunch = hello.capabilities and Proto.CAP_LAUNCH_APP != 0
+        hostWantsApps = hello.capabilities and Proto.CAP_LIST_APPS != 0
+        hostWantsUi = hello.capabilities and Proto.CAP_UI_TREE != 0
+        hostWantsExit = hello.capabilities and Proto.CAP_EXIT_INFO != 0
+        hostWantsIp = hello.capabilities and Proto.CAP_IP_CHECK != 0
+        hostWantsHttp = hello.capabilities and Proto.CAP_HTTP_LOCAL != 0
+        hostWantsText = hello.capabilities and Proto.CAP_TEXT_INPUT != 0
+        if (hostWantsUi) startUiChanges(l) else stopUiChanges()
         l.sendControl(Messages.hello(caps, NAME).encode())
         val lay = layout
         if (lay != null) {
@@ -873,6 +1073,44 @@ class ScreenCaptureService : Service(), HostLink.Listener {
             )
         }
         lastJpeg?.let { deliverFrame(it, lastPtsUs) }
+        reportForeground(true)
+    }
+
+    /** «Экран изменился» → хосту (STATUS 21): служба элементов экрана зовёт не чаще 4 раз в секунду */
+    private fun startUiChanges(l: HostLink) {
+        UiTreeService.onChange = {
+            if (link === l && sessionActive && hostWantsUi) l.sendControl(Messages.status(Proto.STATUS_UI_CHANGED, "").encode())
+        }
+    }
+
+    private fun stopUiChanges() {
+        UiTreeService.onChange = null
+    }
+
+    /**
+     * Пакет на переднем плане → хосту (STATUS 16), если хост попросил (CAP_FOREGROUND в его HELLO).
+     * Без «Доступа к истории использования» — STATUS 17 "usage_access": хост покажет, что разрешить.
+     * force — сразу (после HELLO), иначе при смене пакета и раз в секунду (хост по этому видит свежесть).
+     */
+    private fun reportForeground(force: Boolean) {
+        val l = link ?: return
+        if (!sessionActive || !hostWantsForeground) return
+        val watch = foregroundWatch ?: ForegroundWatch(this).also { foregroundWatch = it }
+        val now = SystemClock.elapsedRealtime()
+        if (!watch.granted()) {
+            if (force || foregroundSent != null || now - foregroundSentAt >= FOREGROUND_REPEAT_MS) {
+                l.sendControl(Messages.status(Proto.STATUS_FOREGROUND_UNAVAILABLE, "usage_access").encode())
+                foregroundSent = null
+                foregroundSentAt = now
+            }
+            return
+        }
+        val pkg = watch.poll() ?: ""
+        if (force || pkg != foregroundSent || now - foregroundSentAt >= FOREGROUND_REPEAT_MS) {
+            l.sendControl(Messages.status(Proto.STATUS_FOREGROUND, pkg).encode())
+            foregroundSent = pkg
+            foregroundSentAt = now
+        }
     }
 
     private fun logHeartbeat() {
@@ -949,6 +1187,11 @@ class ScreenCaptureService : Service(), HostLink.Listener {
 
     override fun onDestroy() {
         Log.d(TAG, "Service onDestroy: кадров отправлено=$framesSent, подключений=$connects")
+        stopUiChanges()
+        uiExecutor.shutdownNow()
+        ipExecutor.shutdownNow()
+        httpExecutor.shutdownNow()
+        textExecutor.shutdownNow()
         running = false
         isRunning = false
         projectionAlive = false

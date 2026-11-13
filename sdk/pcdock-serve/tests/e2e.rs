@@ -554,3 +554,71 @@ fn a_client_that_never_reads_cannot_stall_the_others() {
         assert!(t1.elapsed() < Duration::from_secs(10), "сервер не отключил клиента");
     }
 }
+
+#[test]
+fn app_requests_reach_the_phone_and_replies_go_to_the_requester_without_watch() {
+    let (farm, phone) = farm_with_phone(5);
+    let serve = Serve::new(farm);
+    let addr = serve.run_tcp("127.0.0.1:0").unwrap();
+    let mut asker = Conn::open(addr);
+    asker.expect_hello();
+    let mut other = Conn::open(addr);
+    other.expect_hello();
+
+    asker.send_raw(r#"{"op":"LaunchApp","phone":5,"request":7,"package":"com.example.app","id":1}"#);
+    assert_eq!(asker.json()["ev"], "Ok");
+    asker.send_raw(r#"{"op":"UiDump","phone":5,"request":8}"#);
+    asker.send_raw(r#"{"op":"ExitInfo","phone":5,"request":9,"since_ms":100,"package":"com.example.app"}"#);
+    asker.send_raw(r#"{"op":"IpCheck","phone":5,"request":10,"url":"https://example.com/ip"}"#);
+    asker.send_raw(concat!(
+        r#"{"op":"HttpLocal","phone":5,"request":12,"method":"POST","url":"http://192.168.1.1/cgi?1","#,
+        r#""headers":{"Referer":"http://192.168.1.1/","Content-Type":"text/plain"},"body":"[x]","timeout_ms":5000}"#
+    ));
+    asker.send_raw(r#"{"op":"HttpLocal","phone":5,"request":13,"url":"http://192.168.1.1/"}"#);
+    asker.send_raw(r#"{"op":"TypeText","phone":5,"request":14,"text":"Привет 👋 #тест\nстрока"}"#);
+    asker.send_raw(r#"{"op":"ListApps","phone":5,"request":11,"id":2}"#);
+    assert_eq!(asker.json()["ev"], "Ok");
+    let t0 = Instant::now();
+    while !phone.log().contains("ListApps") && t0.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let log = phone.log();
+    for want in [
+        r#"LaunchApp { request: 7, package: "com.example.app" }"#,
+        "UiDump { request: 8 }",
+        r#"ExitInfo { request: 9, since_ms: 100, package: "com.example.app" }"#,
+        r#"IpCheck { request: 10, url: "https://example.com/ip" }"#,
+        concat!(
+            r#"HttpLocal { request: 12, method: "POST", url: "http://192.168.1.1/cgi?1", headers: [("Content-Type", "text/plain"), "#,
+            r#"("Referer", "http://192.168.1.1/")], body: "[x]", timeout_ms: 5000 }"#
+        ),
+        r#"HttpLocal { request: 13, method: "GET", url: "http://192.168.1.1/", headers: [], body: "", timeout_ms: 0 }"#,
+        r#"TypeText { request: 14, text: "Привет 👋 #тест\nстрока" }"#,
+        "ListApps { request: 11 }",
+    ] {
+        assert!(log.contains(want), "нет {want} в\n{log}");
+    }
+
+    // Ответ телефона приходит тому, кто спрашивал, хотя он не подписан на кадры; остальным — нет.
+    phone.push(Event::Status(pcdock_core::packet::Status { code: 18, detail: "7 ok".into() }));
+    match asker.msg() {
+        ServerMsg::Status { phone: 5, code: 18, detail } => assert_eq!(detail, "7 ok"),
+        m => panic!("ждали Status 18, пришло {m:?}"),
+    }
+    let reply =
+        r#"12 {"ok":true,"code":401,"body":"[error]0","headers":{"set-cookie":"JSESSIONID=1"},"ms":30}"#;
+    phone.push(Event::Status(pcdock_core::packet::Status { code: 24, detail: reply.into() }));
+    match asker.msg() {
+        ServerMsg::Status { phone: 5, code: 24, detail } => assert_eq!(detail, reply),
+        m => panic!("ждали Status 24, пришло {m:?}"),
+    }
+    let reply = r#"14 {"ok":true,"method":"clipboard","reason":"no_service","ms":3}"#;
+    phone.push(Event::Status(pcdock_core::packet::Status { code: 25, detail: reply.into() }));
+    match asker.msg() {
+        ServerMsg::Status { phone: 5, code: 25, detail } => assert_eq!(detail, reply),
+        m => panic!("ждали Status 25, пришло {m:?}"),
+    }
+    other.send_raw(r#"{"op":"List","id":3}"#);
+    let m = other.msg();
+    assert!(matches!(m, ServerMsg::Phones { .. }), "Status не должен доходить до чужого клиента: {m:?}");
+}

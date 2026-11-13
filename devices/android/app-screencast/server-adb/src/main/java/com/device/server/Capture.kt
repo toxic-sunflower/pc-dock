@@ -2,11 +2,13 @@ package com.device.server
 
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.IBinder
 import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
@@ -41,6 +43,8 @@ class Capture(
     private var manager: DisplayManager? = null
     private var reader: ImageReader? = null
     private var display: VirtualDisplay? = null
+    /** Дисплей через SurfaceControl (Android 11 и старше: у DisplayManager нет createVirtualDisplay без проекции). */
+    private var scDisplay: IBinder? = null
     private var shown: DisplayState? = null
     private var running = false
     private var lastFrameAt = 0L
@@ -116,14 +120,45 @@ class Capture(
         val dm = manager ?: Hidden.displayManager(Hidden.context()).also { manager = it }
         val r = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
         r.setOnImageAvailableListener({ onImage(it, w, h) }, handler)
-        val create = DisplayManager::class.java.getDeclaredMethod(
-            "createVirtualDisplay", String::class.java, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType,
-            Int::class.javaPrimitiveType, Surface::class.java,
-        )
-        display = create.invoke(dm, "pcdock", w, h, 0, r.surface) as VirtualDisplay
+        val create = try {
+            DisplayManager::class.java.getDeclaredMethod(
+                "createVirtualDisplay", String::class.java, Int::class.javaPrimitiveType, Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType, Surface::class.java,
+            )
+        } catch (_: NoSuchMethodException) {
+            null
+        }
+        if (create != null) {
+            display = create.invoke(dm, "pcdock", w, h, 0, r.surface) as VirtualDisplay
+        } else {
+            scDisplay = surfaceControlDisplay(r.surface, d.width, d.height, w, h)
+        }
         reader = r
         shown = d
         Log.i(tag, "Захват: ${d.width}x${d.height} rot=${d.rotation} -> поток ${w}x$h")
+    }
+
+    /**
+     * Зеркало экрана через скрытый SurfaceControl (как scrcpy до Android 12): дисплей-проекция слоя 0 на `surface`.
+     * На Android 11 `secure = true` разрешён процессу shell и нужен, чтобы видеть защищённые окна так же, как экран.
+     */
+    private fun surfaceControlDisplay(surface: Surface, dw: Int, dh: Int, w: Int, h: Int): IBinder {
+        val sc = Class.forName("android.view.SurfaceControl")
+        val secure = android.os.Build.VERSION.SDK_INT < 30 ||
+            (android.os.Build.VERSION.SDK_INT == 30 && android.os.Build.VERSION.CODENAME != "S")
+        val token = sc.getMethod("createDisplay", String::class.java, Boolean::class.javaPrimitiveType)
+            .invoke(null, "pcdock", secure) as IBinder
+        sc.getMethod("openTransaction").invoke(null)
+        try {
+            sc.getMethod("setDisplaySurface", IBinder::class.java, Surface::class.java).invoke(null, token, surface)
+            sc.getMethod("setDisplayProjection", IBinder::class.java, Int::class.javaPrimitiveType, Rect::class.java, Rect::class.java)
+                .invoke(null, token, 0, Rect(0, 0, dw, dh), Rect(0, 0, w, h))
+            sc.getMethod("setDisplayLayerStack", IBinder::class.java, Int::class.javaPrimitiveType).invoke(null, token, 0)
+        } finally {
+            sc.getMethod("closeTransaction").invoke(null)
+        }
+        Log.i(tag, "Захват через SurfaceControl (нет DisplayManager.createVirtualDisplay без проекции)")
+        return token
     }
 
     private fun release() {
@@ -132,6 +167,13 @@ class Capture(
         } catch (_: Throwable) {
         }
         display = null
+        scDisplay?.let {
+            try {
+                Class.forName("android.view.SurfaceControl").getMethod("destroyDisplay", IBinder::class.java).invoke(null, it)
+            } catch (_: Throwable) {
+            }
+        }
+        scDisplay = null
         try {
             reader?.setOnImageAvailableListener(null, null)
             reader?.close()

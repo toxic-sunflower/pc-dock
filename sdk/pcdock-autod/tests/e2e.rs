@@ -10,7 +10,9 @@ use pcdock_autod::runs::Runs;
 use pcdock_autod::service;
 use pcdock_autod::store::ScriptStore;
 use pcdock_client::Client;
-use pcdock_core::link::{Discovery, InputCmd, LinkError, LinkFactory, PhoneLink, Sighting, Transport};
+use pcdock_core::link::{
+    AppRequest, Discovery, InputCmd, LinkError, LinkFactory, PhoneLink, Sighting, Transport,
+};
 use pcdock_core::session::Event;
 use pcdock_farm::{DiscoveryConfig, Farm};
 use pcdock_serve::{FileBackend, FileOptions, FileWriter, Serve};
@@ -38,6 +40,38 @@ impl PhoneLink for FakeLink {
     }
     fn input(&mut self, cmd: &InputCmd) -> Result<(), LinkError> {
         self.inputs.lock().unwrap().push(format!("{cmd:?}"));
+        // Приложение на телефоне отвечает на запросы, как настоящее: `Status` с номером запроса.
+        if let InputCmd::App(req) = cmd {
+            let id = req.request();
+            let replies: Vec<(u16, String)> = match req {
+                AppRequest::LaunchApp { .. } => vec![(18, format!("{id} ok"))],
+                AppRequest::HttpLocal { url, .. } if url == "http://192.168.1.1/" => {
+                    vec![(
+                        24,
+                        format!(r#"{id} {{"ok":true,"code":401,"body":"[error]0","headers":{{}},"ms":7}}"#),
+                    )]
+                }
+                // Поля с фокусом нет — текст только в буфере обмена, Ctrl+V жмёт хост
+                AppRequest::TypeText { .. } => {
+                    vec![(
+                        25,
+                        format!(r#"{id} {{"ok":true,"method":"clipboard","reason":"no_focus","ms":3}}"#),
+                    )]
+                }
+                AppRequest::UiDump { .. } => vec![
+                    (20, format!(r#"{id} 1/2 xml <hierarchy><node text="" bounds="[0,0][1000,2000]">"#)),
+                    (
+                        20,
+                        format!(r#"{id} 2/2 <node text="OK" bounds="[0,0][200,200]" /></node></hierarchy>"#),
+                    ),
+                ],
+                _ => vec![(req.reply_code(), format!("{id} unsupported"))],
+            };
+            let mut q = self.events.lock().unwrap();
+            for (code, detail) in replies {
+                q.push_back(Event::Status(pcdock_core::packet::Status { code, detail }));
+            }
+        }
         Ok(())
     }
     fn shutdown(&mut self) {}
@@ -486,4 +520,41 @@ fn lua_scripts_move_files_through_the_whole_chain() {
     assert_eq!(info["report"]["status"], "passed", "{info}");
     assert_eq!(fs.0.lock().unwrap().get("/sdcard/Download/big.txt").map(Vec::len), Some(big.len()));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lua_asks_the_phone_app_through_the_farm_daemon() {
+    let e = env("app");
+    let c = e.client();
+    let events = c.take_events().unwrap();
+    let id = e.put(
+        &c,
+        "Приложение",
+        r#"
+        test("app", function()
+          local p = phones()[1]
+          assert.eq(p:launch("com.example.app"), "ok")
+          local ok = p:find("OK")
+          assert.near(ok.x, 0.1, 0.001)
+          p:tap_on("OK")
+          assert.eq(p:ip("https://example.com/ip"), "unsupported")
+          local r = p:http{method = "POST", url = "http://192.168.1.1/", body = "[x]"}
+          assert.truthy(r.ok)
+          assert.eq(r.code, 401)
+          assert.eq(r.body, "[error]0")
+          p:type("Подпись ✨ #тест")
+          assert.eq(p:paste("x"), "clipboard")
+        end)
+        "#,
+    );
+    let started = c.request(json!({"op": "Run", "script": id})).unwrap();
+    let run = started["run"].as_str().unwrap().to_string();
+    let (evs, end) = follow(&events, &run);
+    assert_eq!(end["status"], "passed", "{evs:?}");
+    assert!(e.wait_inputs(r#"LaunchApp { request: "#), "{}", e.inputs());
+    assert!(e.inputs().contains("UiDump"), "{}", e.inputs());
+    assert!(e.inputs().contains(r#"HttpLocal { request: "#), "{}", e.inputs());
+    assert!(e.inputs().contains(r#"text: "Подпись ✨ #тест" }"#), "{}", e.inputs());
+    assert!(e.inputs().contains("Key { usage: 224, down: true }"), "Ctrl+V после clipboard: {}", e.inputs());
+    assert!(e.inputs().contains("Key { usage: 25, down: true }"), "Ctrl+V после clipboard: {}", e.inputs());
 }

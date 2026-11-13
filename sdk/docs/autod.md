@@ -73,6 +73,9 @@ end)
 
 ### Телефоны
 
+Методы приложения (`launch`, `apps`, `foreground`, `ui`, `find`, `wait_for`, `tap_on`, `exit_info`, `ip`) работают с приложением pc-dock,
+которое умеет возможности 6–13 (`devices/android/PROTOCOL.md`); телефон без них отвечает `"unsupported"` (`ui`/`find` — ошибкой).
+
 `phones()` список телефонов, выделенных прогону; `phone(id)` один из них. Телефон выделяется эксклюзивно (два прогона на одном телефоне невозможны).
 Координаты везде доли экрана `0..1` отображаемой картинки.
 
@@ -84,12 +87,23 @@ end)
 | `p:swipe(x1, y1, x2, y2, opts)` | протяжка; `opts`: `duration`, `steps`, `pressure`, `size` |
 | `p:touch(phase, x, y, opts)` | одна фаза: `"down"`, `"move"`, `"up"`, `"cancel"` (для жестов из нескольких пальцев: `finger`) |
 | `p:key(name_or_usage, opts)` | клавиша по имени (`"a"`, `"enter"`, `"esc"`, `"f1"`) или коду USB HID; `opts.hold` |
-| `p:type(text)` | набор латиницы, цифр и пробела |
+| `p:type(text)` | ввод текста: латиница, цифры, пробел и `-=.,/` — набором HID-клавиатуры (заглавные через Shift); всё остальное (кириллица, эмодзи, `#@!`, переводы строк) — через приложение pc-dock (возможность 13 `TEXT_INPUT`, как `p:paste`). Старое приложение без неё — ошибка `app_outdated: …` (обновить pc-dock), сбой ввода — `text_input_failed: …` |
+| `p:paste(text)` | вставить любой текст (≤ 16 КБ) в поле с курсором через приложение pc-dock (возможность 13), без набора по клавише: телефон вставляет его службой специальных возможностей («Вставить» или «Задать текст») или кладёт в буфер обмена — тогда автоматизация жмёт Ctrl+V. Возвращает способ: `"paste"`, `"set_text"`, `"clipboard"`; ошибки — как у `p:type` |
 | `p:scroll(ticks)`, `p:scroll_h(ticks)` | колесо |
 | `p:wake()`, `p:enable(kind, on)` | побудка; включить/выключить устройство (`"touch"`, `"mouse"`, `"keyboard"`) |
 | `p:frame(opts)` | кадр экрана; `opts`: `timeout` (5 с), `fresh` (дождаться нового) |
 | `p:wait_change(timeout)` | ждёт, пока картинка изменится; возвращает кадр или `nil` |
 | `p:push(dest, data, opts)`, `p:pull(src, max)`, `p:ls(path)`, `p:rm(path)` | файлы на телефоне (нужен `pcdockd --files`); `opts.media` |
+| `p:launch(pkg, opts)` | открыть приложение; возвращает итог телефона: `"ok"`, `"not_installed"`, `"blocked_bal"`, `"error …"` |
+| `p:apps()` | приложения с главным экраном (таблица из ответа телефона) |
+| `p:foreground()` | пакет на переднем плане или `nil` |
+| `p:ui()` | элементы экрана: XML uiautomator |
+| `p:find(sel, opts)` | элемент или `nil`; `sel` — строка (текст целиком) или `{text, text_contains, id, desc, class, index}`; `opts.timeout` — ждать (по умолчанию не ждёт). Элемент: `text, id, desc, class, package, clickable, enabled, x, y` (центр в долях), `bounds` |
+| `p:wait_for(sel, timeout)` | ждёт появления элемента (по умолчанию 10 с), true/false |
+| `p:tap_on(sel, opts)` | нажать на центр элемента, ждёт его до `opts.timeout` (10 с); нет элемента — ошибка |
+| `p:exit_info(pkg, since_ms)` | причины завершения приложения (Android 11+): таблица или строка (`"unsupported"`, `"no_permission"`) |
+| `p:ip(url)` | HTTPS GET по сети телефона (внешний IP): таблица или строка-ошибка |
+| `p:http{method, url, headers, body, timeout}` | HTTP-запрос к устройству локальной Wi-Fi-сети телефона (админка роутера) через Wi-Fi телефона: `method` — `"GET"` (по умолчанию) или `"POST"`, `url` — `http(s)://` с IPv4 частной сети (`192.168.…`, `10.…`, `172.16–31.…`, `169.254.…`), `headers` — таблица, `body` — только у `POST` (≤ 64 КБ), `timeout` — секунды (10, не больше 30). Возвращает `{ok = true, code, body, headers, ms}` (любой код HTTP, в том числе 401; имена заголовков строчными, несколько `set-cookie` — через `\n`) или `{ok = false, error}`: `bad_url`, `bad_request`, `no_wifi`, `timeout`, `io: …`, `unsupported` (приложение pc-dock без возможности 12 — обновить) |
 
 Кадр (`frame`): `seq`, `pts` (с), `bytes`, `width`, `height`, `phone`, метод `save(name)` кладёт его во вложения прогона.
 Первая просьба кадра подписывает автоматизацию на видео телефона (с частотой `--frame-fps`), в конце прогона подписка снимается: если больше никто не смотрит,
