@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use crate::backend::Backend;
 use crate::events::{RunLog, Sink};
-use crate::lua::{run_script, RunConfig};
+use crate::lua::{run_script_ex, RunConfig};
 use crate::store::ScriptStore;
 
 fn now_ms() -> u64 {
@@ -30,6 +30,7 @@ pub struct Run {
     pub dir: PathBuf,
     pub log: Arc<RunLog>,
     stop: Arc<AtomicBool>,
+    abort: Arc<Mutex<Option<String>>>,
     finished: Mutex<Option<(u64, String)>>,
 }
 
@@ -197,6 +198,7 @@ impl Runs {
             dir: dir.clone(),
             log: Arc::new(RunLog::new(&id, Some(&dir))),
             stop: Arc::new(AtomicBool::new(false)),
+            abort: Arc::new(Mutex::new(None)),
             finished: Mutex::new(None),
         });
         self.runs.lock().unwrap().insert(id.clone(), run.clone());
@@ -210,7 +212,7 @@ impl Runs {
             .spawn(move || {
                 let cfg = RunConfig { phones: r.phones.clone(), args: args.clone(), only, timeout, artifacts: Some(r.dir.clone()) };
                 let sink: Arc<dyn Sink> = r.log.clone();
-                let report = run_script(&source, &r.script_name, &cfg, me.backend.clone(), sink, r.stop.clone());
+                let report = run_script_ex(&source, &r.script_name, &cfg, me.backend.clone(), sink, r.stop.clone(), r.abort.clone());
                 let finished = now_ms();
                 let doc = json!({
                     "run": r.id, "script": {"id": r.script_id, "name": r.script_name}, "phones": r.phones, "args": args,
@@ -234,6 +236,19 @@ impl Runs {
         match self.get(id) {
             Some(r) if !r.is_finished() => {
                 r.stop.store(true, Ordering::SeqCst);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Хост прерывает прогон ошибкой с причиной (его часть работы не удалась, например перезагрузка роутера по метке
+    /// сценария): сценарий падает со статусом `error` и этим текстом на ближайшем действии. `false` — прогона нет или он
+    /// закончился.
+    pub fn fail(&self, id: &str, message: &str) -> bool {
+        match self.get(id) {
+            Some(r) if !r.is_finished() => {
+                *r.abort.lock().unwrap() = Some(message.to_string());
                 true
             }
             _ => false,

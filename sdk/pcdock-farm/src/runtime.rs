@@ -157,6 +157,8 @@ pub struct Farm {
     ev_tx: Sender<FarmEvent>,
     ev_rx: Receiver<FarmEvent>,
     auto: Option<Auto>,
+    /// Телефоны, снятые `unpin`: `Lost` о них отдаёт ближайший `drain`.
+    pending_lost: Vec<PhoneId>,
 }
 
 /// Закреплённый телефон: правило «этот телефон должен быть». Частный случай обнаружения: подходящие
@@ -346,7 +348,7 @@ struct Auto {
 impl Farm {
     pub fn new() -> Self {
         let (ev_tx, ev_rx) = mpsc::channel();
-        Self { slots: HashMap::new(), ev_tx, ev_rx, auto: None }
+        Self { slots: HashMap::new(), ev_tx, ev_rx, auto: None, pending_lost: Vec::new() }
     }
 
     /// Канал событий наружу. Неблокирующий опрос — через `try_recv`.
@@ -455,6 +457,51 @@ impl Farm {
         auto.switch.insert(id, transport);
         auto.last_scan = None;
         Ok(())
+    }
+
+    /// Закрепить телефон на ходу: с ближайшего обнаружения ферма его берёт (даже без автообнаружения).
+    /// Так приложение может подключать телефоны по одному по просьбе человека.
+    pub fn pin(&mut self, spec: PhoneSpec) -> Result<(), String> {
+        let auto = self.auto.as_mut().ok_or("обнаружение не включено")?;
+        if !auto.cfg.rules.pinned.contains(&spec) {
+            auto.cfg.rules.pinned.push(spec);
+        }
+        auto.last_scan = None;
+        Ok(())
+    }
+
+    /// Снять закрепление. Телефоны, которые правила больше не принимают, отключаются (USB-аксессуар возвращается
+    /// в обычный режим); возвращает их номера, событие `Lost` для каждого придёт из `drain`.
+    pub fn unpin(&mut self, spec: &PhoneSpec) -> Result<Vec<PhoneId>, String> {
+        let auto = self.auto.as_mut().ok_or("обнаружение не включено")?;
+        let before = auto.cfg.rules.pinned.len();
+        auto.cfg.rules.pinned.retain(|p| p != spec);
+        if auto.cfg.rules.pinned.len() == before {
+            return Err("такой телефон не закреплён".into());
+        }
+        let mut drop = Vec::new();
+        for (key, t) in &auto.tracked {
+            let meta = self.slots.get(&t.id).map(|s| &s.meta);
+            let sight = Sighting {
+                transport: t.transport,
+                address: meta.and_then(|m| m.address.clone()).unwrap_or_default(),
+                serial: meta.and_then(|m| m.serial.clone()),
+                issue: None,
+            };
+            if spec.matches(&sight) && !auto.cfg.rules.accepts(&sight) {
+                drop.push((key.clone(), t.id));
+            }
+        }
+        let mut ids = Vec::new();
+        for (key, id) in drop {
+            auto.tracked.remove(&key);
+            ids.push(id);
+        }
+        for id in &ids {
+            let _ = self.remove_phone(*id);
+            self.pending_lost.push(*id);
+        }
+        Ok(ids)
     }
 
     /// Сведения обо всех телефонах (по возрастанию номера).
@@ -724,6 +771,9 @@ impl Farm {
     /// Возвращает события для фронтенда (сокеты, окно, скрипты).
     pub fn drain(&mut self) -> Vec<FarmEvent> {
         let mut out = Vec::new();
+        for phone in std::mem::take(&mut self.pending_lost) {
+            out.push(FarmEvent::Lost { phone });
+        }
         self.run_discovery(false, &mut out);
         while let Ok(ev) = self.ev_rx.try_recv() {
             let phone = match &ev {
@@ -1144,6 +1194,22 @@ mod tests {
         let evs = f.discover_now();
         assert_eq!(appeared(&evs), vec![(1, Transport::Usb)]);
         assert_eq!(f.phones().len(), 1);
+    }
+
+    #[test]
+    fn phones_are_pinned_and_unpinned_at_runtime() {
+        let (mut f, seen) = auto_farm(Duration::from_secs(3600));
+        f.auto.as_mut().unwrap().cfg.rules.auto = false;
+        *seen.lock().unwrap() =
+            vec![sight(Transport::Usb, "1-2", Some("AAA")), sight(Transport::Adb, "BBB", Some("BBB"))];
+        assert!(appeared(&f.discover_now()).is_empty(), "без закрепления ничего не берём");
+        f.pin(PhoneSpec::parse("usb:1-2").unwrap()).unwrap();
+        assert_eq!(appeared(&f.discover_now()), vec![(1, Transport::Usb)]);
+        assert!(f.unpin(&PhoneSpec::parse("adb:BBB").unwrap()).is_err());
+        assert_eq!(f.unpin(&PhoneSpec::parse("usb:1-2").unwrap()).unwrap(), vec![1]);
+        assert!(f.phones().is_empty());
+        assert!(f.drain().iter().any(|e| matches!(e, FarmEvent::Lost { phone: 1 })));
+        assert!(appeared(&f.discover_now()).is_empty(), "снятый телефон не возвращается сам");
     }
 
     #[test]

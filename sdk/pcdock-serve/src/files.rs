@@ -78,15 +78,40 @@ impl FileWriter for AdbWriter {
     fn finish(self: Box<Self>, size: u64, media: bool) -> Result<(), String> {
         let this = *self;
         this.inner.finish()?;
-        // Команда не сообщает о нехватке места и правах: сверяем размер.
-        let got = this.adb.file_size(&this.serial, &this.dest)?;
-        if got != size {
-            return Err(format!("записано {got} из {size} байт (нет места или прав?)"));
-        }
+        // Команда не сообщает о нехватке места и правах: сверяем размер. Поток `exec:` закрывается сразу, а `cat` на
+        // телефоне дописывает файл ещё какое-то время — ждём, пока размер дорастёт.
+        wait_full_size(|| this.adb.file_size(&this.serial, &this.dest), size, SIZE_WAIT, std::thread::sleep)?;
         if media {
             let _ = this.adb.media_scan(&this.serial, &this.dest);
         }
         Ok(())
+    }
+}
+
+/// Сколько ждать, пока записанный файл дорастёт до ожидаемого размера.
+const SIZE_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Ждёт, пока размер файла станет `size`: пока растёт или ещё мал — опрашивает (100 мс, удваивая до 1 с) до `limit`.
+/// Больше ожидаемого или не дорос за `limit` — ошибка с последним размером.
+fn wait_full_size(
+    mut get: impl FnMut() -> Result<u64, String>,
+    size: u64,
+    limit: std::time::Duration,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Result<(), String> {
+    let mut waited = std::time::Duration::ZERO;
+    let mut step = std::time::Duration::from_millis(100);
+    loop {
+        let got = get()?;
+        if got == size {
+            return Ok(());
+        }
+        if got > size || waited >= limit {
+            return Err(format!("записано {got} из {size} байт (нет места или прав?)"));
+        }
+        sleep(step);
+        waited += step;
+        step = (step * 2).min(std::time::Duration::from_secs(1));
     }
 }
 
@@ -150,6 +175,45 @@ mod tests {
 
     fn opts() -> FileOptions {
         FileOptions::adb(None, None)
+    }
+
+    /// `cat` на телефоне дописывает файл после закрытия потока: сначала 0, потом часть, потом весь
+    #[test]
+    fn waits_until_file_is_full() {
+        let mut sizes = [0u64, 0, 40_000, 92_068].into_iter();
+        let mut slept = Vec::new();
+        let r = wait_full_size(|| Ok(sizes.next().unwrap()), 92_068, SIZE_WAIT, |d| slept.push(d));
+        assert_eq!(r, Ok(()));
+        assert_eq!(slept.len(), 3);
+    }
+
+    #[test]
+    fn short_file_fails_after_limit() {
+        let mut slept = std::time::Duration::ZERO;
+        let r = wait_full_size(|| Ok(10), 100, std::time::Duration::from_secs(3), |d| slept += d);
+        assert_eq!(r, Err("записано 10 из 100 байт (нет места или прав?)".to_string()));
+        assert!(
+            slept >= std::time::Duration::from_secs(3) && slept < std::time::Duration::from_secs(5),
+            "{slept:?}"
+        );
+    }
+
+    #[test]
+    fn bigger_file_or_stat_error_fails_at_once() {
+        let mut calls = 0;
+        assert!(wait_full_size(
+            || {
+                calls += 1;
+                Ok(200)
+            },
+            100,
+            SIZE_WAIT,
+            |_| {}
+        )
+        .is_err());
+        assert_eq!(calls, 1);
+        let r = wait_full_size(|| Err("нет файла /sdcard/x".to_string()), 100, SIZE_WAIT, |_| {});
+        assert_eq!(r, Err("нет файла /sdcard/x".to_string()));
     }
 
     #[test]

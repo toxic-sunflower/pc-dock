@@ -3,7 +3,7 @@
 //! Идентификатор сценария во всех сообщениях называется `script` (поле `id` занято номером запроса).
 //!
 //! Команды (`"op"`): `Phones`, `ScriptList`, `ScriptGet`, `ScriptPut`, `ScriptRename`, `ScriptDelete`, `Run`, `Stop`,
-//! `Runs`, `RunInfo`, `Subscribe`, `Artifacts`, `Artifact`. Всем клиентам приходят `RunStarted` и `RunEnded`;
+//! `Fail` (`{run, message}`: хост прерывает прогон ошибкой), `Runs`, `RunInfo`, `Subscribe`, `Artifacts`, `Artifact`. Всем клиентам приходят `RunStarted` и `RunEnded`;
 //! события прогона (`RunEvent`) приходят подписчикам.
 
 use std::sync::Arc;
@@ -123,6 +123,14 @@ impl Handler<()> for Service {
             }
             "Stop" => {
                 if self.runs.stop(&str_of("run").unwrap_or_default()) {
+                    reply(json!({"ev": "Ok"}))
+                } else {
+                    fail("нет идущего прогона".into())
+                }
+            }
+            "Fail" => {
+                let why = str_of("message").unwrap_or_else(|| "прогон прерван хостом".into());
+                if self.runs.fail(&str_of("run").unwrap_or_default(), &why) {
                     reply(json!({"ev": "Ok"}))
                 } else {
                     fail("нет идущего прогона".into())

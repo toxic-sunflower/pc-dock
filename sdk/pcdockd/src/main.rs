@@ -16,6 +16,10 @@ struct Args {
     #[arg(long, short = 'a')]
     auto: bool,
 
+    /// Стартовать без телефонов: их закрепляет клиент командой `Pin`.
+    #[arg(long)]
+    manual: bool,
+
     /// Закреплённый телефон: принимается всегда. Формат: `usb` (любой USB-телефон),
     /// `usb:1-2.3` (на этом USB-порту), `usb:СЕРИЙНИК`, `adb:СЕРИЙНИК`, `serial:ПУТЬ`.
     /// Без --auto это «только эти». Можно несколько раз.
@@ -148,7 +152,7 @@ fn main() {
             }
         }
     }
-    if !args.auto && pinned.is_empty() {
+    if !args.auto && pinned.is_empty() && !args.manual {
         log::error!("нужен --auto или хотя бы один --phone (см. --help)");
         std::process::exit(2);
     }
@@ -168,6 +172,7 @@ fn main() {
         video: args.video,
         audio: args.audio,
         auto: args.auto,
+        manual: args.manual,
         except: args.except.clone(),
         pinned,
         usb: !args.no_usb,
@@ -243,6 +248,21 @@ fn main() {
     log::info!("pcdockd работает, трубки: {:?}", serve.daemon().lock().unwrap().phones());
     // Воркеры и слушатели живут в своих потоках; главный ждёт сигнала завершения (Ctrl+C, SIGTERM).
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    // Родитель умер (pynelo закрылся аварийно или не успел остановить нас) — завершаемся сами, как по SIGTERM:
+    // иначе сирота держит USB телефонов и следующий запуск родителя их не видит. Включается переменной
+    // PCDOCK_PARENT_PID=<pid родителя>; опрос раз в 2 с (getppid меняется, когда родителя не стало).
+    #[cfg(unix)]
+    if let Some(want) = std::env::var("PCDOCK_PARENT_PID").ok().and_then(|s| s.parse::<u32>().ok()) {
+        let tx = stop_tx.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if std::os::unix::process::parent_id() != want {
+                log::warn!("родитель {want} завершился — завершаюсь");
+                let _ = tx.send(());
+                return;
+            }
+        });
+    }
     if let Err(e) = ctrlc::set_handler(move || {
         let _ = stop_tx.send(());
     }) {

@@ -143,6 +143,21 @@ fn main() {
     log::info!("pcdock-autod работает, данные: {}", args.data.display());
 
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    // Родитель умер (pynelo закрылся аварийно или не успел остановить нас) — завершаемся сами, как по SIGTERM:
+    // иначе сирота держит USB телефонов и следующий запуск родителя их не видит. Включается переменной
+    // PCDOCK_PARENT_PID=<pid родителя>; опрос раз в 2 с (getppid меняется, когда родителя не стало).
+    #[cfg(unix)]
+    if let Some(want) = std::env::var("PCDOCK_PARENT_PID").ok().and_then(|s| s.parse::<u32>().ok()) {
+        let tx = stop_tx.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if std::os::unix::process::parent_id() != want {
+                log::warn!("родитель {want} завершился — завершаюсь");
+                let _ = tx.send(());
+                return;
+            }
+        });
+    }
     if ctrlc::set_handler(move || {
         let _ = stop_tx.send(());
     })

@@ -130,6 +130,89 @@ pub enum ClientMsg {
         video: bool,
         audio: bool,
     },
+    /// Запросы к приложению на телефоне (возможности 7–14). Ответ — событие `Status` (коды 18, 19, 20, 22–26) с
+    /// `detail`, начинающимся с `request`; приходит запросившему клиенту, даже без `Watch`.
+    /// Закрепить телефон (`usb:1-2.3`, `usb:СЕРИЙНИК`, `adb:СЕРИЙНИК`, `serial:ПУТЬ`): ферма его возьмёт при ближайшем
+    /// обнаружении (событие `Appeared`). Нужен демон с обнаружением (`--auto`, `--phone` или `--manual`).
+    Pin {
+        spec: String,
+    },
+    /// Снять закрепление: телефон отключается (USB-аксессуар возвращается в обычный режим), придёт `Lost`.
+    Unpin {
+        spec: String,
+    },
+    /// Получать сообщения приложения телефона (`Status`: передний план, ответы) без подписки на кадры.
+    AppEvents {
+        phone: u32,
+        on: bool,
+    },
+    LaunchApp {
+        phone: u32,
+        request: u32,
+        package: String,
+    },
+    ListApps {
+        phone: u32,
+        request: u32,
+    },
+    UiDump {
+        phone: u32,
+        request: u32,
+    },
+    ExitInfo {
+        phone: u32,
+        request: u32,
+        since_ms: u64,
+        package: String,
+    },
+    IpCheck {
+        phone: u32,
+        request: u32,
+        url: String,
+    },
+    /// HTTP-запрос к устройству локальной Wi-Fi-сети телефона (возможность 12): `method` — `GET` (по умолчанию) или
+    /// `POST`, `url` — `http(s)://` с IPv4 частной сети, `body` — только у `POST`, `timeout_ms` — 0/нет = 10 с, до 30 с.
+    HttpLocal {
+        phone: u32,
+        request: u32,
+        #[serde(default = "default_http_method")]
+        method: String,
+        url: String,
+        #[serde(default)]
+        headers: std::collections::BTreeMap<String, String>,
+        #[serde(default)]
+        body: String,
+        #[serde(default)]
+        timeout_ms: u32,
+    },
+    /// Ввести текст (любой язык, эмодзи; не пустой, ≤ 16 КБ UTF-8) в поле с курсором (возможность 13). Ответ `Status`
+    /// 25 `"<request> <JSON>"`: `{"ok":true,"method":"paste"|"set_text"|"clipboard","ms"}` или `{"ok":false,"error"}`;
+    /// `"clipboard"` — текст только в буфере обмена телефона, клиент жмёт Ctrl+V сам (`Key` 0xE0 + 0x19).
+    TypeText {
+        phone: u32,
+        request: u32,
+        text: String,
+    },
+    /// Включить (`on: true`) или выключить Wi-Fi телефона (возможность 14). Ответ `Status` 26 `"<request> <JSON>"`:
+    /// `{"ok":true,"enabled":true,"method":"api"|"quick_settings"|"already","ms"}` или
+    /// `{"ok":false,"error":"no_service"|"tile_not_found"|"timeout"|…,"enabled":false,"ms"}`.
+    SetWifi {
+        phone: u32,
+        request: u32,
+        on: bool,
+    },
+    /// Положить текст в буфер обмена телефона (возможность 15; те же правила текста, что у `TypeText`), не вставляя в
+    /// поле. Ответ `Status` 27 `"<request> <JSON>"`: `{"ok":true,"ms"}` или `{"ok":false,"error":"bad_request"|
+    /// "clipboard: …"|"not_negotiated"}`; старый телефон — `"<request> error unsupported"`.
+    SetClipboard {
+        phone: u32,
+        request: u32,
+        text: String,
+    },
+}
+
+fn default_http_method() -> String {
+    "GET".into()
 }
 
 /// Запрос клиента: команда и необязательный номер `id`. Если `id` есть, ответ на эту команду несёт тот же `id`.

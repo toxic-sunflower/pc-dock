@@ -58,4 +58,39 @@ class ProtocolTest {
         assertEquals(70, s.jpegQuality)
         assertEquals(30, s.maxFps)
     }
+
+    @Test
+    fun textInputIsParsed() {
+        // Тот же payload, что шлёт pcdock_core::packet::TextInputReq: u32 request_id, затем UTF-8 до конца
+        val text = "Привет 👋 #тест\nстрока"
+        val payload = byteArrayOf(0x0A, 0x0B, 0x0C, 0x0D) + text.toByteArray(Charsets.UTF_8)
+        val t = assertNotNull(Messages.parseTextInput(payload))
+        assertEquals(0x0A0B0C0DL, t.requestId)
+        assertEquals(text, t.bytes.toString(Charsets.UTF_8))
+        assertEquals(null, Messages.parseTextInput(byteArrayOf(1, 2)))
+        assertEquals(0x49, Proto.T_TEXT_INPUT)
+        assertEquals(1 shl 13, Proto.CAP_TEXT_INPUT)
+        assertEquals(25, Proto.STATUS_TEXT_INPUT)
+    }
+
+    @Test
+    fun wifiSetIsParsed() {
+        // Тот же payload, что шлёт pcdock_core::packet::WifiSetReq: u32 request_id, u8 on
+        val w = assertNotNull(Messages.parseWifiSet(byteArrayOf(1, 2, 3, 4, 1)))
+        assertEquals(0x01020304L, w.requestId)
+        assertEquals(true, w.on)
+        assertEquals(false, assertNotNull(Messages.parseWifiSet(byteArrayOf(0, 0, 0, 9, 0))).on)
+        assertEquals(null, Messages.parseWifiSet(byteArrayOf(0, 0, 0, 9)))
+        assertEquals(0x4A, Proto.T_WIFI_SET)
+        assertEquals(1 shl 14, Proto.CAP_WIFI_TOGGLE)
+        assertEquals(26, Proto.STATUS_WIFI_SET)
+    }
+
+    @Test
+    fun clipboardSetConstants() {
+        // Payload — как у TEXT_INPUT (parseTextInput); коды — те же, что в pcdock_core
+        assertEquals(0x4B, Proto.T_CLIPBOARD_SET)
+        assertEquals(1 shl 15, Proto.CAP_CLIPBOARD_SET)
+        assertEquals(27, Proto.STATUS_CLIPBOARD_SET)
+    }
 }

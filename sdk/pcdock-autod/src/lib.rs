@@ -7,3 +7,4 @@ pub mod lua;
 pub mod runs;
 pub mod service;
 pub mod store;
+pub mod uitree;
