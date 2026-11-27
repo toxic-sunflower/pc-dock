@@ -1,6 +1,6 @@
 # SDK (Rust)
 
-Исходники продукта на Rust. Документация: [`docs/`](docs/README.md). Общий обзор: [`../README.md`](../README.md).
+Исходники продукта на Rust. Документация: [`docs/`](docs/README.md); примеры клиентов: [`examples/`](examples/pcdock.py). Общий обзор: [`../README.md`](../README.md).
 
 | Крейт | Что это |
 |---|---|

@@ -19,8 +19,10 @@ REPO = "https://github.com/toxic-sunflower/pc-dock"
 
 # Порядок и названия в боковом меню.
 PAGES = [
+    ("what-is-pcdock", "Что это и зачем"),
     ("install", "Установка"),
     ("getting-started", "Быстрый старт"),
+    ("recipes", "Рецепты"),
     ("operations", "Эксплуатация"),
     ("protocol", "Протокол"),
     ("daemon", "pcdockd"),
